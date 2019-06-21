@@ -61,7 +61,6 @@ int main(void)
         alldata = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems * n_pes);
 
         for (j = 0; j < nr_elems; j++) {
-        //    data[j].nr = my_pe * nr_elems + j;
             data[j].data = (long) my_pe * i + j;
         }               
 
@@ -76,17 +75,19 @@ int main(void)
         }
 
         if (shmem_my_pe() == 0) {
+        #ifdef ALLTOALL_DEBUG
             printf("completed iteration %d\n", i);
-/*            for (j = 0; j < n_pes; j++) {
+            for (j = 0; j < n_pes; j++) {
                 int k = 0;
                 printf("%d: ", j);
                 for (k; k < nr_elems; k++) {
                     printf("%lu ", alldata[j*nr_elems + k].data);
                 }
                 printf("\n");
-            }*/
+            }
+        #endif
 
-            printf("Time with size: %lu:\n", sizeof(data_t) * nr_elems);
+            printf("Time with size %lu:\n", sizeof(data_t) * nr_elems);
             print_report(&report, MAX_ITER - SKIP, tstamp);
 
 
