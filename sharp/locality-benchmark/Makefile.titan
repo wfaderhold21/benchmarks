@@ -1,0 +1,17 @@
+SHARP_PREFIX=/lustre/atlas/scratch/wa9/csc221/build/install.sharp-nvram
+UCX_PREFIX=/lustre/atlas/scratch/wa9/csc221/build/install.ucx
+RTE_PREFIX=/lustre/atlas/scratch/wa9/csc221/build/install.rte
+
+CFLAGS = -O3 -I${SHARP_PREFIX}/include -I${SHARP_PREFIX}/include/sharp -I${SHARP_PREFIX}/include/sharp/utils -I${UCX_PREFIX}/include -I${RTE_PREFIX}/include
+CC = cc
+LDFLAGS = -L${SHARP_PREFIX}/lib -L${UCX_PREFIX}/lib -L${RTE_PREFIX}/lib -lsharp -lpmem -lvmem -lmemkind -lucs -luct -lucm -lucp -lrte
+
+.PHONY: clean
+
+all: locality
+
+locality: locality.c 
+	${CC} ${CFLAGS} locality.c -o locality ${LDFLAGS}
+
+clean:
+	rm locality
