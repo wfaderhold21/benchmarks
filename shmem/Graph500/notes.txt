@@ -1,0 +1,38 @@
+global var: oned_csr_graph g
+
+run_bfs is the BFS  (args are root (int) and pred (int *))
+    nlocalverts => local vertices (found in g)
+    nglobalverts => global vertices (found in g)
+
+    pred => predecessor map, the function points to this with orig_pred
+    pred2 => allocated here, is a modifiable map
+    
+    elts_per_queue_bit => ??
+    ulong_bits => the number of bits in a unsigned long
+    queue_nbits => the number of local vertices and elts_per_queue_bit - 1 /
+elts_per_queue_bit
+
+    queue_nwords => ??
+    queue_bitmap1 => first bitmap?
+    queue_bitmap2 => second bitmap?
+
+    first bitmap is set to 0
+
+    local_vertices => list of local vertices
+        each one is set to VERTEX_TO_GLOBAL(rank, i);
+    masks => list of all bitmasks for an unsigned long?
+    
+    coding for predecessor map
+        i. white => not visited => INT64_MAX
+        ii. grey => in the queue => 0 .. nglobalverts-1
+        iii. black => done => -nglobalverts .. -1
+
+    predecessor map is initialized locally to all white
+
+    the root node is set to grey 
+
+    mpi windows are created on the predecessor maps and the queues
+    
+    infinite loop:
+        clear the next level of the queue
+        pred is copied over pred2
