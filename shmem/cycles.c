@@ -163,14 +163,14 @@ static double proc_get_cpu_mhz(int no_cpu_freq_fail)
 			continue;
 		}
 		if (mhz != m) {
-			fprintf(stderr, "Conflicting CPU frequency values"
+/*			fprintf(stderr, "Conflicting CPU frequency values"
 				" detected: %lf != %lf\n", mhz, m);
 			if (no_cpu_freq_fail) {
 				fprintf(stderr, "Test integrity may be harmed !\n");
 			}else{
 				return 0.0;
 			}
-			continue;
+			continue;*/
 		}
 	}
 	fclose(f);
