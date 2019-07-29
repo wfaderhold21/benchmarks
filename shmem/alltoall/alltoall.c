@@ -73,7 +73,7 @@ int main(void)
         pSync[i] = SHMEM_SYNC_VALUE;
     }
 
-    for (i = 0; i <= 23; i++) {
+    for (i = 0; i <= 20; i++) {
         nr_elems = (1 << i);
         double f_start = 0, f_end = 0, i_time = 0;
         double latency = 0, bandwidth = 0;
@@ -81,12 +81,13 @@ int main(void)
         int j = 0, k = 0;
 
 #if WITH_HINTS
-        data = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems);
+        data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems, SHMEM_HINT_NEAR_NIC_MEM);
         alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes, SHMEM_HINT_NEAR_NIC_MEM);
 #else
         data = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems);
         alldata = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems * n_pes);
 #endif
+
         for (j = 0; j < nr_elems; j++) {
             data[j].data = (long) my_pe * i + j;
         }               
@@ -103,9 +104,8 @@ int main(void)
         }
         f_end = TIME();
         latency = ((f_end - f_start)) / MAX_ITER; // in us
-        size = (1.0 * n_pes * MAX_ITER * nr_elems); // MB
+        size = (1.0 * n_pes * MAX_ITER * nr_elems); // bytes
         bandwidth = size / (i_time / 1e6);
-//        bandwidth = (n_pes * (MAX_ITER * (nr_elems * sizeof(data_t)))) * (1 / (f_end - f_start) / 1000000); // MBs
 
         if (shmem_my_pe() == 0) {
         #ifdef ALLTOALL_DEBUG
@@ -127,7 +127,6 @@ int main(void)
             } else {
                 printf("** Time with size %lu MB:\n", nr_elems / (1024 * 1024));
             }
-            //printf("\tsize: %g, i_time: %g, total: %g\n", size, i_time, f_end - f_start);
             printf("\tAvg Latency: %g us\n", latency);
             printf("\tBandwidth: %g MB/s\n", bandwidth / (1024 * 1024));
         }
