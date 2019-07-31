@@ -65,7 +65,7 @@ int main(void)
     n_pes = shmem_n_pes();
 
 #if WITH_HINTS
-    pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_NEAR_NIC_MEM);
+    pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_NUMA_0);
 #else
     pSync = (long *) shmem_malloc(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE);
 #endif
@@ -73,7 +73,7 @@ int main(void)
         pSync[i] = SHMEM_SYNC_VALUE;
     }
 
-    for (i = 0; i <= 20; i++) {
+    for (i = 0; i <= 18; i++) {
         nr_elems = (1 << i);
         double f_start = 0, f_end = 0, i_time = 0;
         double latency = 0, bandwidth = 0;
@@ -81,8 +81,8 @@ int main(void)
         int j = 0, k = 0;
 
 #if WITH_HINTS
-        data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems, SHMEM_HINT_NEAR_NIC_MEM);
-        alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes, SHMEM_HINT_NEAR_NIC_MEM);
+        data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems, SHMEM_HINT_NUMA_0);
+        alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes , SHMEM_HINT_NUMA_0);
 #else
         data = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems);
         alldata = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems * n_pes);
