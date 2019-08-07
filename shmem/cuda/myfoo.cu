@@ -70,17 +70,7 @@ void foo(params_t * param)
                    M * sizeof(float), 
                    cudaMemcpyHostToDevice);
     }
-    /*if (!(down != -1 && j == (M / num_pes - 2))) {
-        cudaMemcpy(&(param->c_a[2 * M]), 
-                   param->a[j + 1], 
-                   M * sizeof(float), 
-                   cudaMemcpyHostToDevice);
-    } else {
-        cudaMemcpy(&(param->c_a[2 * M]), 
-                   param->d, 
-                   M * sizeof(float), 
-                   cudaMemcpyHostToDevice);
-    }*/
+    
     cudaMemcpy(param->c_b, 
                param->b[j], 
                M * sizeof(float), 
@@ -89,28 +79,4 @@ void foo(params_t * param)
     compute<<<NR_BLOCK, 1>>>(param->c_a, param->c_b);
     cudaMemcpy(param->b[j], param->c_b, M * sizeof(float), cudaMemcpyDeviceToHost);
 }
-           /*cudaMemcpy(c_a, a[j - 1], M * sizeof(float), cudaMemcpyHostToDevice);
-           cudaMemcpy(&c_a[M], a[j], M * sizeof(float), cudaMemcpyHostToDevice);
-           cudaMemcpy(&c_a[2*M], a[j+1], M * sizeof(float), cudaMemcpyHostToDevice);
-           
-           cudaMemcpy(b[j], c_b, M * sizeof(float), cudaMemcpyDeviceToHost); */
-       //}
-       
-//       printf("[debug] updating a with b\n");
-/*       for (j = 1; j < M - 1; j++) {
-           for (k = 1; k < M - 1; k++) {
-               a[j][k] = b[j][k];
-           }
-       }*/
-/*       #ifdef DEBUG
-       printf("[debug output of b]\n");
-       for (j = 0; j < M; j++) {
-           for (k = 0; k < M; k++) {
-               printf("%5.5g ", a[j][k]);
-           }
-           printf("\n");
-       }
-       printf("\n\n");
-       #endif * DEBUG * */
-    //}   
-//}
+

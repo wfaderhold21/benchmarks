@@ -9,11 +9,6 @@
 
 #include "common.h"
 
-//#define M 8
-//const int M = 1000;
-//const int nr_blocks = 1024;
-
-
 static inline struct timespec mydifftime(struct timespec start, struct timespec end)
 {
     struct timespec temp;
@@ -40,7 +35,6 @@ struct params {
 };
 typedef struct params params_t;
 
-//void _Z3fooP6params(params_t *);
 void foo(params_t *);
 
 int main(int argc, char ** argv) {
@@ -69,8 +63,6 @@ int main(int argc, char ** argv) {
     c_a = (float *) shmemx_malloc_with_hint((size_t) (sizeof(float) * M / npes * M), SHMEM_HINT_DEVICE_GPU_MEM);
     c_b = (float *) shmemx_malloc_with_hint((size_t) (sizeof(float) * M / npes * M), SHMEM_HINT_DEVICE_GPU_MEM);
 
-//    cudaMalloc((void **)&c_a, sizeof(float) * M * M);
-//    cudaMalloc((void **)&c_b, sizeof(float) * M * M);
     for (j = 0; j < (M / npes); j++) {
         a[j] = (float *) shmem_malloc(sizeof(float) * M);
         b[j] = (float *) shmem_malloc(sizeof(float) * M);
@@ -119,7 +111,6 @@ int main(int argc, char ** argv) {
             param.j = j;
             
             foo(&param);
-            //_Z3fooP6params(&param);
         }
         for (l = start; l < stop; l++) {
             for (k = 1; k < M - 1; k++) {
@@ -165,8 +156,6 @@ int main(int argc, char ** argv) {
     
     shmem_free(c_a);
     shmem_free(c_b);
-    //cudaFree(c_a);
-    //cudaFree(c_b);
 
     shmem_finalize();
 
