@@ -75,13 +75,24 @@ if (0 == thread_id) {
 #if WITH_HINTS
     pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_NUMA_1);
     pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
+    data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * (1 << 18), SHMEM_HINT_NUMA_1);
+    alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * (1 << 18) * n_pes , SHMEM_HINT_NUMA_1);
 #else
+    pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
     pSync = (long *) shmem_malloc(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE);
+    data = (data_t *) shmem_malloc(sizeof(data_t) * (1 << 18));
+    alldata = (data_t *) shmem_malloc(sizeof(data_t) * (1 << 18) * n_pes);
 #endif
+    for (j = 0; j < nr_elems; j++) {
+        data[j].data = (long) my_pe * i + j;
+    }               
+
     for (i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
         pSync[i] = SHMEM_SYNC_VALUE;
     }
+}
 
+if (0 == thread_id) {
     for (i = 0; i <= 18; i++) {
         nr_elems = (1 << i);
         double f_start = 0, f_end = 0, i_time = 0;
@@ -89,19 +100,6 @@ if (0 == thread_id) {
         double size = 0;
         int j = 0, k = 0;
 
-#if WITH_HINTS
-        data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems, SHMEM_HINT_NUMA_1);
-        alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes , SHMEM_HINT_NUMA_1);
-#else
-        data = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems);
-        alldata = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems * n_pes);
-#endif
-
-        for (j = 0; j < nr_elems; j++) {
-            data[j].data = (long) my_pe * i + j;
-        }               
-
-if (0 == thread_id){
         for (k = 0; k < MAX_ITER + SKIP; k++) {
             double iter = 0;
             if (k == SKIP) {
@@ -157,9 +155,6 @@ if (0 == thread_id){
             printf("\tAvg Latency: %g us\n", latency);
             printf("\tBandwidth: %g MB/s\n", bandwidth / (1024 * 1024));
         }
-
-        shmem_free(data);
-        shmem_free(alldata);
     }
 }
 
