@@ -59,7 +59,7 @@ int main(void)
     double *pWork = NULL;
     data_t * data;
     data_t * alldata;
-    int i = 0;
+    int i = 0, j = 0;
 
     shmem_init();
     my_pe = shmem_my_pe();
@@ -68,10 +68,10 @@ int main(void)
 	int nthreads, thread_id;
 #pragma omp parallel private(nthreads, thread_id)
 {
-thread_id = omp_get_thread_num();
+	thread_id = omp_get_thread_num();
+	nthreads = omp_get_num_threads();
 
-
-if (0 == thread_id) {
+if (nthreads-1 == thread_id) {
 #if WITH_HINTS
     pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_NUMA_1);
     pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
@@ -91,6 +91,8 @@ if (0 == thread_id) {
         pSync[i] = SHMEM_SYNC_VALUE;
     }
 }
+
+#pragma omp barrier 
 
 if (0 == thread_id) {
     for (i = 0; i <= 18; i++) {
@@ -159,7 +161,7 @@ if (0 == thread_id) {
 }
 
 #pragma omp barrier
-
+}
     shmem_finalize();
     return 0;
 }
