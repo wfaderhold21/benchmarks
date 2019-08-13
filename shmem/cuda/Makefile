@@ -1,6 +1,6 @@
 NVCC=nvcc
 CC=g++
-PREFIX=/nfshome/waderholdt/work/src/test/install.ompi-sharp
+PREFIX=/home/cc/install.ompi-sharp
 CFLAGS=-O2 -g -I${PREFIX}/include
 LDFLAGS=-L/usr/local/cuda/lib64 -L${PREFIX}/lib -lcuda -loshmem -lcudart 
 
