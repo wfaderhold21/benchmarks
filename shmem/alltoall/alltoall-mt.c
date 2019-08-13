@@ -5,8 +5,12 @@
 #include <shmem.h>
 #include <shmemx.h>
 
+#define MAX_UPDATES 1000
 #define MAX_ITER    100
 #define SKIP        10
+
+#define MAX_SHIFT 24
+#define MAX_SIZE ((1 << MAX_SHIFT))
 
 /*
  * Blatant copy from OSU...
@@ -25,11 +29,7 @@ double getMicrosecondTimeStamp()
 
 #define TIME()    getMicrosecondTimeStamp()
 
-/* arbitrary data larger than 64 bits */
-struct data {
-    char data;
-};
-typedef struct data data_t;
+#define data_t char
 
 /*
  * Linear all to all implementation
@@ -57,45 +57,93 @@ int main(void)
     int my_pe, n_pes;
     long * pSync =NULL;
     double *pWork = NULL;
-    data_t * data;
-    data_t * alldata;
+    char * data;
+    char * alldata;
     int i = 0, j = 0;
+    long hint; 
 
     shmem_init();
     my_pe = shmem_my_pe();
     n_pes = shmem_n_pes();
+
+    #ifdef NEAR
+    hint = SHMEM_HINT_NUMA_0;
+    #else
+    hint = SHMEM_HINT_NUMA_1;
+    #endif
+
+    double *src_buff = NULL, *dest_buff = NULL, agg_bw;
+    src_buff = shmem_malloc(sizeof(double));
+    dest_buff = shmem_malloc(sizeof(double));
+
 
 	int nthreads, thread_id;
 #pragma omp parallel private(nthreads, thread_id)
 {
 	thread_id = omp_get_thread_num();
 	nthreads = omp_get_num_threads();
-
+#ifdef NEAR
+if (0 == thread_id) {
+#else 
 if (nthreads-1 == thread_id) {
+#endif 
+
 #if WITH_HINTS
-    pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_NUMA_1);
+    pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, hint);
     pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
-    data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * (1 << 18), SHMEM_HINT_NUMA_1);
-    alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * (1 << 18) * n_pes , SHMEM_HINT_NUMA_1);
+    data = (char *) shmemx_malloc_with_hint(sizeof(data_t) * MAX_SIZE, hint);
+    alldata = (char *) shmemx_malloc_with_hint(sizeof(data_t) * MAX_SIZE * n_pes , hint);
 #else
     pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
     pSync = (long *) shmem_malloc(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE);
-    data = (data_t *) shmem_malloc(sizeof(data_t) * (1 << 18));
-    alldata = (data_t *) shmem_malloc(sizeof(data_t) * (1 << 18) * n_pes);
+    data = (data_t *) shmem_malloc(sizeof(data_t) * MAX_SIZE);
+    alldata = (data_t *) shmem_malloc(sizeof(data_t) * MAX_SIZE * n_pes);
 #endif
     for (j = 0; j < nr_elems; j++) {
-        data[j].data = (long) my_pe * i + j;
+        data[j] = (char) my_pe * i + j;
+        alldata[j] = (char) rand() % 255; 
     }               
 
     for (i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
         pSync[i] = SHMEM_SYNC_VALUE;
     }
+    printf("data: %p, alldata: %p\n", data, alldata);
 }
-
 #pragma omp barrier 
 
+// local memory update operation
 if (0 == thread_id) {
-    for (i = 0; i <= 18; i++) {
+    for (i = 0; i <= MAX_SHIFT; i++) {
+        double start = 0, end = 0;
+        int j = 0, k = 0;
+        double avg_lat = 0.0;
+        size_t size = 1 << i;
+        // write "random" data to the buffer
+        for (j = 0; j < MAX_UPDATES; j++) {
+            if (j == 0) {
+                start = TIME();
+            }
+            memcpy(data, alldata, size);
+        }
+        end = TIME(); 
+        avg_lat = (end - start) / MAX_UPDATES;
+        if (my_pe == 0) {
+            if (size < 1024) {
+                printf("** Memory updates with size %lu:\n", size);
+            } else if (size < (1024 * 1024)) {
+                printf("** Memory updates with size %lu kB:\n", size / 1024);
+            } else {
+                printf("** Memory updates with size %lu MB:\n", size / (1024 * 1024));
+            }
+            printf("\tAvg Latency: %g us\n", avg_lat);
+        }    
+    }
+}
+        
+
+
+if (0 == thread_id) {
+    for (i = 0; i <= MAX_SHIFT; i++) {
         nr_elems = (1 << i);
         double f_start = 0, f_end = 0, i_time = 0;
         double latency = 0, bandwidth = 0;
@@ -117,36 +165,12 @@ if (0 == thread_id) {
         size = (1.0 * n_pes * MAX_ITER * nr_elems); // bytes
         bandwidth = size / (i_time / 1e6);
 
-        {   double *src_buff = NULL, *dest_buff = NULL, agg_bw;
-		    src_buff = shmem_malloc(sizeof(double));
-		    dest_buff = shmem_malloc(sizeof(double));
+        *src_buff = bandwidth;
+        shmem_double_sum_to_all(dest_buff, src_buff, 1,0,0,n_pes,pWork,pSync);
+        agg_bw = *dest_buff;
 
-			*src_buff = bandwidth;
-			shmem_double_sum_to_all(dest_buff, src_buff, 1,0,0,n_pes,pWork,pSync);
-		
-			agg_bw = *dest_buff;
-
-			if (0 == shmem_my_pe()) {
-				fprintf(stdout,"Aggreate bandwidth %g MB/s\n", agg_bw/(1024 * 1024));
-			}
-
-        }
-        
-	
-		
+			
         if (shmem_my_pe() == 0) {
-        #ifdef ALLTOALL_DEBUG
-            printf("completed iteration %d\n", i);
-            for (j = 0; j < n_pes; j++) {
-                int k = 0;
-                printf("%d: ", j);
-                for (; k < nr_elems; k++) {
-                    printf("%d ", alldata[j*nr_elems + k].data);
-                }
-                printf("\n");
-            }
-        #endif
-
             if (nr_elems < 1024) {
                 printf("** Time with size %lu:\n", sizeof(data_t) * nr_elems);
             } else if (nr_elems < (1024 * 1024)) {
@@ -156,6 +180,7 @@ if (0 == thread_id) {
             }
             printf("\tAvg Latency: %g us\n", latency);
             printf("\tBandwidth: %g MB/s\n", bandwidth / (1024 * 1024));
+            fprintf(stdout,"\tAggreate bandwidth %g MB/s\n", agg_bw/(1024 * 1024));
         }
     }
 }
