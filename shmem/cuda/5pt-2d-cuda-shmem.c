@@ -3,11 +3,31 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/time.h>
 #include <time.h>
 #include <shmem.h>
 #include <shmemx.h>
 
 #include "common.h"
+
+/*
+ * Blatant copy from OSU...
+ */
+double getMicrosecondTimeStamp()
+{
+    double retval;
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL)) {
+        perror("gettimeofday");
+        abort();
+    }
+    retval = ((double)tv.tv_sec) * 1000000 + tv.tv_usec;
+    return retval;
+}
+
+#define TIME()    getMicrosecondTimeStamp()
+
+
 
 static inline struct timespec mydifftime(struct timespec start, struct timespec end)
 {
@@ -44,9 +64,10 @@ int main(int argc, char ** argv) {
     int j = 0, k = 0;
     int me, npes, up, down;
     int start, stop;
-    struct timespec time1;
-    struct timespec time2;
-    struct timespec result;
+    double time1,time2,result;
+    //struct timespec time1;
+    //struct timespec time2;
+    //struct timespec result;
     params_t param;
 
     shmem_init();
@@ -56,12 +77,12 @@ int main(int argc, char ** argv) {
    
     printf("[%d] hello world %d of %d (allocating %d rows)\n", me, me, npes, M / npes); 
 
-    a = (float **) shmem_malloc(sizeof(float *) * M / npes);
-    b = (float **) shmem_malloc(sizeof(float *) * M / npes);
+    a = (float **) shmem_malloc((sizeof(float *) * M) / npes);
+    b = (float **) shmem_malloc((sizeof(float *) * M) / npes);
     c = (float *) shmem_malloc(sizeof(float) * M);
     d = (float *) shmem_malloc(sizeof(float) * M);
-    c_a = (float *) shmemx_malloc_with_hint((size_t) (sizeof(float) * M / npes * M), SHMEM_HINT_DEVICE_GPU_MEM);
-    c_b = (float *) shmemx_malloc_with_hint((size_t) (sizeof(float) * M / npes * M), SHMEM_HINT_DEVICE_GPU_MEM);
+    c_a = (float *) shmemx_malloc_with_hint((size_t) (((sizeof(float) * M) / npes) * M), SHMEM_HINT_DEVICE_GPU_MEM);
+    c_b = (float *) shmemx_malloc_with_hint((size_t) (((sizeof(float) * M) / npes) * M), SHMEM_HINT_DEVICE_GPU_MEM);
 
     for (j = 0; j < (M / npes); j++) {
         a[j] = (float *) shmem_malloc(sizeof(float) * M);
@@ -95,9 +116,9 @@ int main(int argc, char ** argv) {
 
     param.stop = stop;
     shmem_barrier_all();
-
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time1);
-    for (i = 0; i < 10; i++) {
+    time1 = TIME();
+    //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time1);
+    for (i = 0; i < 1024; i++) {
         int l = 0;
         
         if (me != 0) {
@@ -119,8 +140,8 @@ int main(int argc, char ** argv) {
         }
         shmem_barrier_all();
     }
-
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time2);
+    time2 = TIME();
+    //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time2);
 
 #ifdef DEBUG
     if (me == 0) {
@@ -146,16 +167,20 @@ int main(int argc, char ** argv) {
     }
     shmem_barrier_all();
 #endif
-    result = mydifftime(time1, time2);
-    printf("timing: %lu.%.0f sec\n", result.tv_sec, (float)(result.tv_nsec / 1000000.0));
+    result = time2 - time1;
+    //result = mydifftime(time1, time2);
+    if (me == 0) {
+        printf("timing: %g sec\n", result / 1000000);
+    }
+
 
     shmem_free(a);
     shmem_free(b);
     shmem_free(c);
     shmem_free(d);
     
-    shmem_free(c_a);
-    shmem_free(c_b);
+//    shmem_free(c_a);
+//    shmem_free(c_b);
 
     shmem_finalize();
 

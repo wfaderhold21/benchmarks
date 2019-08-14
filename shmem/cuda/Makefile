@@ -8,7 +8,7 @@ LDFLAGS=-L/usr/local/cuda/lib64 -L${PREFIX}/lib -lcuda -loshmem -lcudart
 
 all: 5pt
 
-5pt:    5pt-2d-cuda-shmem.c myfoo.o
+5pt:    5pt-2d-cuda-shmem.c myfoo.o common.h
 	${CC} ${CFLAGS} 5pt-2d-cuda-shmem.c myfoo.o -o 5pt ${LDFLAGS}
 
 myfoo.o:    myfoo.cu
