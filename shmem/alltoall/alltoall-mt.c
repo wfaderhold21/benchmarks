@@ -66,10 +66,14 @@ int main(void)
     my_pe = shmem_my_pe();
     n_pes = shmem_n_pes();
 
-    #ifdef NEAR
+    #if NEAR==1
     hint = SHMEM_HINT_NUMA_0;
-    #else
+    #elif FAR==1
     hint = SHMEM_HINT_NUMA_1;
+    #elif LOCAL==1
+    hint = SHMEM_HINT_LOCAL;
+    #elif INTERLEAVE==1
+    hint = SHMEM_HINT_INTERLEAVE;
     #endif
 
     double *src_buff = NULL, *dest_buff = NULL, agg_bw;
@@ -110,7 +114,6 @@ if (nthreads-1 == thread_id) {
     printf("data: %p, alldata: %p\n", data, alldata);
 }
 #pragma omp barrier 
-
 // local memory update operation
 if (0 == thread_id) {
     for (i = 0; i <= MAX_SHIFT; i++) {
