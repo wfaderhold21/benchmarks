@@ -113,7 +113,10 @@ if (nthreads-1 == thread_id) {
     }
     printf("data: %p, alldata: %p\n", data, alldata);
 }
+
 #pragma omp barrier 
+if (0 == thread_id) 
+	shmem_barrier_all();
 // local memory update operation
 if (0 == thread_id) {
     for (i = 0; i <= MAX_SHIFT; i++) {
@@ -143,7 +146,10 @@ if (0 == thread_id) {
     }
 }
         
+#pragma omp barrier
 
+if (0 == thread_id) 
+	shmem_barrier_all();
 
 if (0 == thread_id) {
     for (i = 0; i <= MAX_SHIFT; i++) {
