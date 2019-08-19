@@ -9,7 +9,7 @@
 #define MAX_ITER    100
 #define SKIP        10
 
-#define MAX_SHIFT 24
+#define MAX_SHIFT 22
 #define MAX_SIZE ((1 << MAX_SHIFT))
 
 /*
@@ -192,6 +192,7 @@ if (0 == thread_id) {
             fprintf(stdout,"\tAggreate bandwidth %g MB/s\n", agg_bw/(1024 * 1024));
         }
     }
+    shmem_barrier_all();
 }
 
 #pragma omp barrier
