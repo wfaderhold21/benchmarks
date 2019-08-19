@@ -1,0 +1,154 @@
+data: 0x2accd08003d8, alldata: 0x2accd18003e0
+** Memory updates with size 1:
+	Avg Latency: 0.005 us
+** Memory updates with size 2:
+	data: 0x2acdfb4003d8, alldata: 0x2acdfc4003e0
+data: 0x2ab3020003d8, alldata: 0x2ab3030003e0
+data: 0x2b5ae64003d8, alldata: 0x2b5ae74003e0
+Avg Latency: 0.004 us
+** Memory updates with size 4:
+	Avg Latency: 0.003 us
+** Memory updates with size 8:
+	Avg Latency: 0.003 us
+** Memory updates with size 16:
+	Avg Latency: 0.005 us
+** Memory updates with size 32:
+	Avg Latency: 0.006 us
+** Memory updates with size 64:
+	Avg Latency: 0.007 us
+** Memory updates with size 128:
+	Avg Latency: 0.008 us
+** Memory updates with size 256:
+	Avg Latency: 0.012 us
+** Memory updates with size 512:
+	Avg Latency: 0.019 us
+** Memory updates with size 1 kB:
+	Avg Latency: 0.028 us
+** Memory updates with size 2 kB:
+	Avg Latency: 0.052 us
+** Memory updates with size 4 kB:
+	Avg Latency: 0.102 us
+** Memory updates with size 8 kB:
+	Avg Latency: 0.199 us
+** Memory updates with size 16 kB:
+	Avg Latency: 0.504 us
+** Memory updates with size 32 kB:
+	Avg Latency: 1.77 us
+** Memory updates with size 64 kB:
+	Avg Latency: 3.445 us
+** Memory updates with size 128 kB:
+	Avg Latency: 7.169 us
+** Memory updates with size 256 kB:
+	Avg Latency: 15.611 us
+** Memory updates with size 512 kB:
+	Avg Latency: 53.419 us
+** Memory updates with size 1 MB:
+	Avg Latency: 173.615 us
+** Memory updates with size 2 MB:
+	Avg Latency: 376.191 us
+** Memory updates with size 4 MB:
+	Avg Latency: 783.02 us
+** Memory updates with size 8 MB:
+	Avg Latency: 1564.19 us
+** Memory updates with size 16 MB:
+	Avg Latency: 3185.07 us
+** Time with size 1:
+	Avg Latency: 4.68 us
+	Bandwidth: 1.86995 MB/s
+	Aggreate bandwidth 7.79256 MB/s
+** Time with size 2:
+	Avg Latency: 4.64 us
+	Bandwidth: 3.85323 MB/s
+	Aggreate bandwidth 15.5821 MB/s
+** Time with size 4:
+	Avg Latency: 4.63 us
+	Bandwidth: 7.90611 MB/s
+	Aggreate bandwidth 31.3021 MB/s
+** Time with size 8:
+	Avg Latency: 5.71 us
+	Bandwidth: 15.4912 MB/s
+	Aggreate bandwidth 62.4191 MB/s
+** Time with size 16:
+	Avg Latency: 4.64 us
+	Bandwidth: 30.3657 MB/s
+	Aggreate bandwidth 123.287 MB/s
+** Time with size 32:
+	Avg Latency: 4.62 us
+	Bandwidth: 63.2489 MB/s
+	Aggreate bandwidth 250.951 MB/s
+** Time with size 64:
+	Avg Latency: 4.69 us
+	Bandwidth: 122.07 MB/s
+	Aggreate bandwidth 499.881 MB/s
+** Time with size 128:
+	Avg Latency: 4.72 us
+	Bandwidth: 237.03 MB/s
+	Aggreate bandwidth 966.834 MB/s
+** Time with size 256:
+	Avg Latency: 5.33 us
+	Bandwidth: 381.47 MB/s
+	Aggreate bandwidth 1564.13 MB/s
+** Time with size 512:
+	Avg Latency: 5.26 us
+	Bandwidth: 737.028 MB/s
+	Aggreate bandwidth 3042.18 MB/s
+** Time with size 1 kB:
+	Avg Latency: 5.52 us
+	Bandwidth: 1390.12 MB/s
+	Aggreate bandwidth 5698.47 MB/s
+** Time with size 2 kB:
+	Avg Latency: 6.15 us
+	Bandwidth: 2284.36 MB/s
+	Aggreate bandwidth 9277.73 MB/s
+** Time with size 4 kB:
+	Avg Latency: 7.87 us
+	Bandwidth: 3156.57 MB/s
+	Aggreate bandwidth 12397.6 MB/s
+** Time with size 8 kB:
+	Avg Latency: 9.59 us
+	Bandwidth: 4477.08 MB/s
+	Aggreate bandwidth 18486.8 MB/s
+** Time with size 16 kB:
+	Avg Latency: 26 us
+	Bandwidth: 2678.95 MB/s
+	Aggreate bandwidth 10862.4 MB/s
+** Time with size 32 kB:
+	Avg Latency: 37.98 us
+	Bandwidth: 3674.31 MB/s
+	Aggreate bandwidth 14854.5 MB/s
+** Time with size 64 kB:
+	Avg Latency: 59 us
+	Bandwidth: 4714.31 MB/s
+	Aggreate bandwidth 19326.2 MB/s
+** Time with size 128 kB:
+	Avg Latency: 100.13 us
+	Bandwidth: 5926.28 MB/s
+	Aggreate bandwidth 23290.6 MB/s
+** Time with size 256 kB:
+	Avg Latency: 215.75 us
+	Bandwidth: 5512.68 MB/s
+	Aggreate bandwidth 21043 MB/s
+** Time with size 512 kB:
+	Avg Latency: 390.77 us
+	Bandwidth: 6090.5 MB/s
+	Aggreate bandwidth 23596.7 MB/s
+** Time with size 1 MB:
+	Avg Latency: 829.11 us
+	Bandwidth: 5596.44 MB/s
+	Aggreate bandwidth 21900 MB/s
+** Time with size 2 MB:
+	Avg Latency: 1742.82 us
+	Bandwidth: 5093.56 MB/s
+	Aggreate bandwidth 20706.1 MB/s
+** Time with size 4 MB:
+	Avg Latency: 3496.72 us
+	Bandwidth: 5032.71 MB/s
+	Aggreate bandwidth 20183.9 MB/s
+** Time with size 8 MB:
+	Avg Latency: 7026.13 us
+	Bandwidth: 5018.47 MB/s
+	Aggreate bandwidth 19774.7 MB/s
+** Time with size 16 MB:
+	Avg Latency: 14005.4 us
+	Bandwidth: 5129.99 MB/s
+	Aggreate bandwidth 19292.8 MB/s
