@@ -180,16 +180,20 @@ if (0 == thread_id) {
 
 			
         if (shmem_my_pe() == 0) {
+			size_t msg_size = 0;
             if (nr_elems < 1024) {
-                printf("** Time with size %lu:\n", sizeof(data_t) * nr_elems);
+				msg_size = sizeof(data_t) * nr_elems;
+                printf("** Time with size %lu:\n", msg_size);
             } else if (nr_elems < (1024 * 1024)) {
-                printf("** Time with size %lu kB:\n", nr_elems / 1024);
+				msg_size = nr_elems/1024;
+                printf("** Time with size %lu kB:\n", msg_size);
             } else {
-                printf("** Time with size %lu MB:\n", nr_elems / (1024 * 1024));
+				msg_size = nr_elems / (1024 * 1024);
+                printf("** Time with size %lu MB:\n", msg_size);
             }
             printf("\tAvg Latency: %g us\n", latency);
             printf("\tBandwidth: %g MB/s\n", bandwidth / (1024 * 1024));
-            fprintf(stdout,"\tAggreate bandwidth %g MB/s\n", agg_bw/(1024 * 1024));
+            fprintf(stdout,"\t %lu Bytes Aggregate bandwidth %g MB/s\n", sizeof(data_t) * nr_elems, agg_bw/(1024 * 1024));
         }
     }
     shmem_barrier_all();
