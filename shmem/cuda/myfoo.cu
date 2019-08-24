@@ -31,6 +31,7 @@ struct params {
     int up, down, j;
     int stop;
     int num_pes;
+    int mype;
 };
 typedef struct params params_t;
 
@@ -40,6 +41,12 @@ void foo(params_t * param)
     int up = param->up;
     int down = param->down;
     int num_pes = param->num_pes;
+    int mype = param->mype;
+    if ((mype % 2) == 1) {
+        cudaSetDevice(1);
+    } else {
+        cudaSetDevice(0);
+    }
     // above
     if (up != -1 && j == 0) {
          cudaMemcpy(param->c_a, 

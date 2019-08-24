@@ -52,6 +52,7 @@ struct params {
     int up, down, j;
     int stop;
     int num_pes;
+    int mype;
 };
 typedef struct params params_t;
 
@@ -113,6 +114,7 @@ int main(int argc, char ** argv) {
     param.num_pes = npes;
     start = (me == 0) ? 1 : 0;
     stop = (me == 0 && npes > 1) ? M / npes : M / npes - 1;
+    param.mype = me;
 
     param.stop = stop;
     shmem_barrier_all();
@@ -139,6 +141,9 @@ int main(int argc, char ** argv) {
             }
         }
         shmem_barrier_all();
+        if (me == 0) {
+            printf("iter %d complete\n", i);
+        }
     }
     time2 = TIME();
     //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time2);
