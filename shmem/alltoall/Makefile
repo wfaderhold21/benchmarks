@@ -36,4 +36,4 @@ alltoall_debug:	alltoall.c
 	$(CC) $(CFLAGS) -DALLTOALL_DEBUG -o alltoall_debug alltoall.c $(LDFLAGS)
 
 clean:
-	rm alltoall alltoall-hint alltoall_debug
+	rm alltoall alltoall-hint alltoall_debug alltoall-mt-near alltoall-mt-far alltoall-mt-near-hint alltoall-mt-far-hint alltoall-mt-local-hint alltoall-mt-interleave-hint
