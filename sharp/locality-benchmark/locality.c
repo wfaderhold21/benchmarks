@@ -76,8 +76,8 @@ static inline int get_times(int nr_iterations, int dest_pe, double * agg, double
     }
     variance = variance / nr_iterations;
 
-    printf("\tget average latency: %0.10g\n", *agg);
-    printf("\tget median latency: %0.10g\n", median);
+    printf("\tget average latency: %0.10g us\n", (*agg * 1000000.0));
+    printf("\tget median latency: %0.10g us\n", median * 1000000.0);
     printf("\tget variance: %0.10g\n", variance);
     return 0;
 }
@@ -111,7 +111,7 @@ static inline int cswap_times(int nr_iterations, int dest_pe, double * agg, doub
     }
 
     *agg = *agg / nr_iterations; //the avg
-    printf("times[%d] + times[%d]\n", nr_iterations/2 - 1, nr_iterations/2);
+//    printf("times[%d] + times[%d]\n", nr_iterations/2 - 1, nr_iterations/2);
     qsort(times, nr_iterations, sizeof(double), cmpfunc);
     median = (times[nr_iterations/2-1] + times[nr_iterations/2]) / 2;
     
@@ -121,8 +121,8 @@ static inline int cswap_times(int nr_iterations, int dest_pe, double * agg, doub
     }
     variance = variance / nr_iterations;
 
-    printf("\tcswap average latency: %0.10g\n", *agg);
-    printf("\tcswap median latency: %0.10g\n", median);
+    printf("\tcswap average latency: %0.10g us\n", *agg * 1000000.0);
+    printf("\tcswap median latency: %0.10g us\n", median * 1000000.0);
     printf("\tcswap variance: %0.10g\n", variance);
     return 0;
 }
@@ -153,7 +153,7 @@ static inline int put_times(int nr_iterations, int dest_pe, double * agg, double
     }
 
     *agg = *agg / nr_iterations; //the avg
-    printf("times[%d] + times[%d]\n", nr_iterations/2 - 1, nr_iterations/2);
+    //printf("times[%d] + times[%d]\n", nr_iterations/2 - 1, nr_iterations/2);
     qsort(times, nr_iterations, sizeof(double), cmpfunc);
     median = (times[nr_iterations/2-1] + times[nr_iterations/2]) / 2;
     
@@ -163,8 +163,8 @@ static inline int put_times(int nr_iterations, int dest_pe, double * agg, double
     }
     variance = variance / nr_iterations;
 
-    printf("\tput average latency: %0.10g\n", *agg);
-    printf("\tput median latency: %0.10g\n", median);
+    printf("\tput average latency: %0.10g us\n", *agg * 1000000.0);
+    printf("\tput median latency: %0.10g us\n", median * 1000000.0);
     printf("\tput variance: %0.10g\n", variance);
     return 0;
 } 
