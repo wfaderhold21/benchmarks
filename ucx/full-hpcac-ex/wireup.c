@@ -693,6 +693,8 @@ void put_lat(char * sdata, int iter, int skip, size_t data_size)
     double median;
     double variance = 0.0;
     double total = 0.0;
+    ucp_request_param_t req_param = {0};
+    ucs_status_ptr_t ucp_status;
 
     assert(iter > skip);
 
@@ -709,8 +711,17 @@ void put_lat(char * sdata, int iter, int skip, size_t data_size)
         for (int i = 0; i < iter; i++) {
             if (i >= skip) {
                 start = TIME();
-                ucp_put(endpoints[1], sdata, data_size, remote_addresses[1], rkeys[1]);
-                ucp_worker_flush(ucp_worker);
+                ucp_status = ucp_put_nbx(endpoints[1], sdata, data_size, remote_addresses[1], rkeys[1], &req_param);
+                if (UCS_OK != ucp_status) {
+                    if (UCS_PTR_IS_ERR(ucp_status)) {
+                        abort();
+                    } else {
+                        while (ucp_request_check_status(ucp_status) == UCS_INPROGRESS) {
+                            ucp_worker_progress(ucp_worker);
+                        }
+                        ucp_request_free(ucp_status);
+                    }
+                }
                 end = TIME();
                 times[j++] = end - start;
                 total += end - start;
