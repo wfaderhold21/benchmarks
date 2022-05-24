@@ -1,5 +1,5 @@
 CC=shmemcc
-CFLAGS=-O3
+CFLAGS=-O3 -g
 LDFLAGS=
 
 .PHONY: all clean
