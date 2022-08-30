@@ -178,15 +178,18 @@ int main(int argc, char ** argv)
 {
     int me;
     int npes;
-    int count = 32768 * 2;
+    int count = 32768;
+    size_t alloc_size = (1024*1024*1024);//(2 * count * npes * sizeof(int64_t)) + 4 * sizeof(int64_t);
 
     MPI_Init(&argc, &argv);
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
-    void * buffer = malloc(8 * ((npes / 2) * count * npes * sizeof(int64_t)) + 8 * sizeof(int64_t));
+    void * buffer = malloc(alloc_size);
     int64_t* dest = buffer; //(int64_t*) shmem_malloc(count * npes * sizeof(int64_t));
+#ifdef VALIDATE
     int64_t* validation = malloc(count * npes * sizeof(int64_t));
-    int64_t* source = buffer + (4 * (npes / 2) * count * npes * sizeof(int64_t));
+#endif
+    int64_t* source = buffer + (alloc_size / 2); //(count * npes * sizeof(int64_t));
     int64_t* displ = malloc(sizeof(int64_t) * npes);
     int64_t* rdispl = malloc(sizeof(int64_t) * npes);
     size_t * counts = malloc(sizeof(size_t) * npes);
@@ -208,31 +211,8 @@ int main(int argc, char ** argv)
         count = size;
     }
 
-    setup_ucc(buffer, (8 * (npes / 2) * (count * npes * sizeof(int64_t)) + sizeof(int64_t) * 8), me, npes);
+    setup_ucc(buffer, alloc_size, me, npes);
 
-    for (int i = 0; i < npes; i++) {
-        counts[i] = ((i % 2) == 0) ? 1 : 2;
-    }
-
-    MPI_Alltoall(counts, 1, MPI_LONG, rcounts, 1, MPI_LONG, MPI_COMM_WORLD);
-
-    /* assign source values */
-    for (int pe = 0; pe < npes; pe++) {
-        for (int i = 0; i < count; i++) {
-            source[(pe * count) + i] = ((me + 1) * 10) + i;
-            dest[(pe * count) + i] = 9999;
-        }
-        displ[pe] = sncounts;
-        rdispl[pe] = rncounts;
-        mpi_displ[pe] = sncounts;
-        mpi_rdispl[pe] = rncounts;
-        mpi_scount[pe] = counts[pe];
-        mpi_rcount[pe] = rcounts[pe];
-        sncounts += counts[pe];
-        rncounts += rcounts[pe];
-    }
-
-    MPI_Alltoallv(source, mpi_scount, mpi_displ, MPI_LONG, validation, mpi_rcount, mpi_rdispl, MPI_LONG, MPI_COMM_WORLD);
     if (me == 0) {
         printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size", 
                                               "PE size",
@@ -251,14 +231,36 @@ int main(int argc, char ** argv)
         min = (double) INT_MAX;
         max_latency = (double) INT_MIN;
         total = 0;
+        size_t total_data_sent = 0;
         
+        for (int i = 0; i < npes; i++) {
+            counts[i] = k;            
+        }
+
+        MPI_Alltoall(counts, 1, MPI_LONG, rcounts, 1, MPI_LONG, MPI_COMM_WORLD);
+
+        /* assign source values */
+        for (int pe = 0; pe < npes; pe++) {
+            displ[pe] = sncounts;
+            rdispl[pe] = rncounts;
+            mpi_displ[pe] = sncounts;
+            mpi_rdispl[pe] = rncounts;
+            mpi_scount[pe] = counts[pe];
+            mpi_rcount[pe] = rcounts[pe];
+            sncounts += counts[pe];
+            rncounts += rcounts[pe];
+        }
+        total_data_sent = sncounts * sizeof(int64_t);
+#ifdef VALIDATE        
+        MPI_Alltoallv(source, mpi_scount, mpi_displ, MPI_LONG, validation, mpi_rcount, mpi_rdispl, MPI_LONG, MPI_COMM_WORLD);
+#endif
         /* alltoall */
         for (int i = 0; i < NR_ITER; i++) {
             double b_start, b_end;
             size_t v_dis = 0;
             start = MPI_Wtime();
 #ifdef WITH_UCC 
-            ucc_alltoallv(source, dest, counts, rcounts, displ, rdispl, npes, buffer + (7 * (count * npes * sizeof(int64_t))));
+            ucc_alltoallv(source, dest, counts, rcounts, displ, rdispl, npes, buffer + (2 * (count * npes * sizeof(int64_t))));
 #else
             MPI_Alltoallv(source, mpi_scount, mpi_displ, MPI_LONG, dest, mpi_rcount, mpi_rdispl, MPI_LONG, MPI_COMM_WORLD);
 #endif
