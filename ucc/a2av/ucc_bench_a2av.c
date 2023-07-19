@@ -138,10 +138,9 @@ int main(int argc, char ** argv)
     }
 
     maps[0].address = dest;
-    maps[0].len = count * npes * sizeof(int64_t);
-
+    maps[0].len = npes * count * npes * sizeof(int64_t);
     maps[1].address = source;
-    maps[1].len = count * npes * sizeof(int64_t);
+    maps[1].len = npes * count * npes * sizeof(int64_t);
     maps[2].address = pSync;
     maps[2].len = 5 * sizeof(long);
     maps[3].address = pSync2;
