@@ -18,14 +18,22 @@
 #define NR_ITER     110
 #define SKIP        10
 
-int verify(const void * src, const int64_t * dest, int count, int rank, int npes)
+int verify(const void * src, const int64_t * dest, int64_t *src_count, ucc_aint_t *src_disp, int64_t *dst_count, ucc_aint_t *dst_disp, size_t count, int rank, int npes)
 {
     int64_t * t_dest = (int64_t *)shmem_malloc(count * npes * sizeof(int64_t));
+    int *mpi_src_count = (int *)malloc(npes * sizeof(int));
+    int *mpi_src_disp = (int *)malloc(npes * sizeof(int));
+    int *mpi_dst_count = (int *)malloc(npes * sizeof(int));
+    int *mpi_dst_disp = (int *)malloc(npes * sizeof(int));
    
     shmem_barrier_all(); 
     for (int i = 0; i < npes; i++) {
-        shmem_putmem_nbi(((void *)t_dest) + rank * count * sizeof(int64_t), src + i * count * sizeof(int64_t), count * sizeof(int64_t), i);
+        mpi_src_count[i] = src_count[i];
+        mpi_dst_count[i] = dst_count[i];
+        mpi_src_disp[i] = src_disp[i];
+        mpi_dst_disp[i] = dst_disp[i];
     }
+    MPI_Alltoallv(src, mpi_src_count, mpi_src_disp, MPI_LONG, t_dest, mpi_dst_count, mpi_dst_disp, MPI_LONG, MPI_COMM_WORLD);
     shmem_barrier_all();
     for (int i = 0; i < npes; i++) {
         if (dest[i] != t_dest[i]) {
@@ -244,7 +252,7 @@ int main(int argc, char ** argv)
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
                 .flags     = UCC_COLL_ARGS_FLAG_COUNT_64BIT | UCC_COLL_ARGS_FLAG_DISPLACEMENTS_64BIT 
-                           | UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS | UCC_COLL_ARGS_FLAG_ONESIDED_VECTOR,
+                           | UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
                 .coll_type = UCC_COLL_TYPE_ALLTOALLV,
                 .src.info_v =
                     {
@@ -294,7 +302,7 @@ int main(int argc, char ** argv)
             shmem_barrier_all();
 
             #ifdef WITH_VERIFY
-            int ret = verify(source, dest, k, me, npes);
+            int ret = verify(source, dest, src_count, src_disp, dst_count, dst_disp, k, me, npes);
             if (ret != 0) {
                 return ret;
             }
