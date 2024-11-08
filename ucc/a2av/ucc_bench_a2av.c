@@ -15,7 +15,7 @@
 
 #include <ucc/api/ucc.h>
 
-#define NR_ITER     110
+#define NR_ITER     100
 #define SKIP        10
 
 int verify(const void * src, const int64_t * dest, int64_t *src_count, ucc_aint_t *src_disp, int64_t *dst_count, ucc_aint_t *dst_disp, size_t count, int rank, int npes)
@@ -82,8 +82,9 @@ int main(int argc, char ** argv)
 {
     int me;// = shmem_me();
     int npes;// = shmem_n_pes();
-    int count = 32768 * 2;
-    //int count = 262144;    
+//    int count = 4;
+    //int count = 32768*2;
+    int count = 262144 * 4;    
     long * pSync;
     long * pSync2;
     long * pSync3;
@@ -122,8 +123,10 @@ int main(int argc, char ** argv)
     src_disp = malloc(sizeof(int64_t) * npes);
     dst_disp = malloc(sizeof(int64_t) * npes);
 
-    int64_t* dest = (int64_t*) shmem_malloc(npes * count * npes * sizeof(int64_t));
-    int64_t* source = (int64_t*) shmem_malloc(npes * count * npes * sizeof(int64_t));
+//    int64_t* dest = (int64_t*) shmem_malloc(npes * count * npes * sizeof(int64_t));
+//    int64_t* source = (int64_t*) shmem_malloc(npes * count * sizeof(int64_t));
+    int64_t* source = (int64_t *) shmem_malloc(npes * (count * sizeof(int64_t)));
+    int64_t* dest = source;// + (npes * count * sizeof(int64_t)); /* to save memory */
 
     int64_t disp = 0;
     int64_t in_disp = 0;
@@ -145,18 +148,18 @@ int main(int argc, char ** argv)
         return -1;
     }
 
-    maps[0].address = dest;
-    maps[0].len = npes * count * npes * sizeof(int64_t);
-    maps[1].address = source;
-    maps[1].len = npes * count * npes * sizeof(int64_t);
-    maps[2].address = pSync;
+//    maps[0].address = dest;
+//    maps[0].len = npes * count * npes * sizeof(int64_t);
+    maps[0].address = source;
+    maps[0].len = 2 * npes * count * sizeof(int64_t);
+    maps[1].address = pSync;
+    maps[1].len = 5 * sizeof(long);
+    maps[2].address = pSync2;
     maps[2].len = 5 * sizeof(long);
-    maps[3].address = pSync2;
-    maps[3].len = 5 * sizeof(long);
-    maps[4].address = pSync3;
-    maps[4].len = SHMEM_REDUCE_SYNC_SIZE * sizeof(long);
-    maps[5].address = pWrk;
-    maps[5].len = SHMEM_REDUCE_MIN_WRKDATA_SIZE * sizeof(double);
+    maps[3].address = pSync3;
+    maps[3].len = SHMEM_REDUCE_SYNC_SIZE * sizeof(long);
+    maps[4].address = pWrk;
+    maps[4].len = SHMEM_REDUCE_MIN_WRKDATA_SIZE * sizeof(double);
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
@@ -166,7 +169,7 @@ int main(int argc, char ** argv)
     ctx_params.oob.n_oob_eps = npes;
     ctx_params.oob.oob_ep = me;
     ctx_params.mem_params.segments = maps;
-    ctx_params.mem_params.n_segments = 6;
+    ctx_params.mem_params.n_segments = 5;
 
     ucc_lib_params_t lib_params = {
         .mask = UCC_LIB_PARAM_FIELD_THREAD_MODE,
@@ -228,7 +231,7 @@ int main(int argc, char ** argv)
                                               "Max Latency");
     }
 
-    for (int k = size; k <= count - 1; k *= 2) {
+    for (int k = size; k < count - 1; k *= 2) {
         double bandwidth = 0, agg_bandwidth = 0;
         double max_agg = 0;
         static double total_bw = 0, min = 0;
@@ -236,13 +239,17 @@ int main(int argc, char ** argv)
         max_latency = (double) INT_MIN;
         total = 0;
         disp = in_disp = 0;
+        memset(src_count, 0, sizeof(int64_t) * npes);
+        memset(dst_count, 0, sizeof(int64_t) * npes);
+        memset(src_disp, 0, sizeof(int64_t) * npes);
+        memset(dst_disp, 0, sizeof(int64_t) * npes);
         for (int i = 0; i < npes; i++) {
             src_count[i] = k;
             dst_count[i] = k;
             src_disp[i] = disp;
             dst_disp[i] = in_disp;
-            disp += i * sizeof(int64_t) * k;
-            in_disp += i * sizeof(int64_t) * k;
+            disp += k;// * /*sizeof(int64_t) * k;
+            in_disp += k;// * /*sizeof(int64_t) * k;
         }
         
         /* alltoall */
