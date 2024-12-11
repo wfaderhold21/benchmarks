@@ -230,7 +230,7 @@ static double run_ucc(bench_desc_t *d, int do_compute, double comp_time, double 
         src_disp[i] = disp;
         dst_disp[i] = in_disp;
         disp += d->msg_size / sizeof(int64_t);// * /*sizeof(int64_t) * k;
-        in_disp += d->msg_size;// * /*sizeof(int64_t) * k;
+        in_disp += d->msg_size / sizeof(int64_t);// * /*sizeof(int64_t) * k;
     }
 
     ucc_coll_args_t coll = {

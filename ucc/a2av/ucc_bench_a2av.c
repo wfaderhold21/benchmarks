@@ -83,8 +83,8 @@ int main(int argc, char ** argv)
     int me;// = shmem_me();
     int npes;// = shmem_n_pes();
 //    int count = 4;
-    //int count = 32768*2;
-    int count = 262144 * 4;    
+    int count = 32768*2;
+    //int count = 262144 * 4;    
     long * pSync;
     long * pSync2;
     long * pSync3;
