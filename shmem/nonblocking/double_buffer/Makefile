@@ -3,14 +3,20 @@ CFLAGS = -O3 -Wall
 LDFLAGS = -lm
 
 TARGET = double_buffer
+TARGET_NOSYNC = double_buffer_nosync
 SRC = double_buffer.c
 
-all: $(TARGET)
+all: $(TARGET) $(TARGET_NOSYNC)
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-clean:
-	rm -f $(TARGET)
+nosync: $(TARGET_NOSYNC)
 
-.PHONY: all clean 
+$(TARGET_NOSYNC): $(SRC)
+	$(CC) $(CFLAGS) -DWITHOUT_SYNC=1 -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET) $(TARGET_NOSYNC)
+
+.PHONY: all clean nosync 
