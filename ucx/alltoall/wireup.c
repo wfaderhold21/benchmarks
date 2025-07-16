@@ -278,6 +278,7 @@ void alltoall_benchmark(char * sdata, int iter, int skip, size_t data_size)
     double total = 0.0;
     double total_bandwidth = 0.0;
     ucp_request_param_t req_param = {0};
+    ucs_status_ptr_t ptrs[size];
     
     assert(iter > skip);
 
@@ -293,43 +294,48 @@ void alltoall_benchmark(char * sdata, int iter, int skip, size_t data_size)
     
     int j = 0;
     for (int i = 0; i < iter; i++) {
-            start = MPI_Wtime();
-            /* Linear alltoall: each PE sends to all other PEs */
-            for (int pe = 0; pe < size; pe++) {
-                    /* Calculate offset for this PE's data segment */
-                    uint64_t remote_offset = (uint64_t)my_pe * data_size;
-                    ucp_put_nbx(endpoints[pe], 
-                                                   sdata, 
-                                                   data_size, 
-                                                   remote_addresses[pe] + remote_offset, 
-                                                   rkeys[pe], 
-                                                   &req_param);
+        start = MPI_Wtime();
+        /* Linear alltoall: each PE sends to all other PEs */
+        for (int pe = 0; pe < size; pe++) {
+            /* Calculate offset for this PE's data segment */
+            uint64_t remote_offset = (uint64_t)my_pe * data_size;
+            ptrs[pe] = ucp_put_nbx(endpoints[pe],
+                        sdata,
+                        data_size,
+                        remote_addresses[pe] + remote_offset,
+                        rkeys[pe],
+                        &req_param);
+        }
+        barrier();
+         
+        /* Flush all put operations to ensure completion */
+        ucs_status_ptr_t flush_req = ucp_worker_flush_nbx(ucp_worker, &req_param);
+        if (UCS_PTR_IS_ERR(flush_req)) {
+            fprintf(stderr, "Error in ucp_worker_flush_nbx\n");
+            abort();
+        } else if (flush_req != UCS_OK) {
+            while (UCS_INPROGRESS == ucp_request_check_status(flush_req)) {
+                ucp_worker_progress(ucp_worker);
+                sched_yield();
             }
-                         barrier();
-             
-             /* Flush all put operations to ensure completion */
-             ucs_status_ptr_t flush_req = ucp_worker_flush_nbx(ucp_worker, &req_param);
-             if (UCS_PTR_IS_ERR(flush_req)) {
-                 fprintf(stderr, "Error in ucp_worker_flush_nbx\n");
-                 abort();
-             } else if (flush_req != UCS_OK) {
-                 while (UCS_INPROGRESS == ucp_request_check_status(flush_req)) {
-                     ucp_worker_progress(ucp_worker);
-                     sched_yield();
-                 }
-                 ucp_request_free(flush_req);
-             }
-            
-            end = MPI_Wtime();
-            if (i >= skip) {
-                times[j++] = 1e6 * (end - start);
-                total += 1e6 * (end - start);
+            ucp_request_free(flush_req);
+        }
+        
+        end = MPI_Wtime();
+        for (int pe = 0; pe < size; pe++) {
+            if (ptrs[pe]) {
+                ucp_request_free(ptrs[pe]);
             }
+        }
+        if (i >= skip) {
+            times[j++] = 1e6 * (end - start);
+            total += 1e6 * (end - start);
+        }
         barrier();
     }
 
     barrier();
-    
+
     /* Calculate statistics */
     total = (total) / (iter - skip);
     qsort(times, iter - skip, sizeof(double), cmpfunc);
