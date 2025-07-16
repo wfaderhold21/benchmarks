@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <ucc/api/ucc.h>
 
@@ -94,6 +95,9 @@ int main(int argc, char ** argv)
     static double src_buff, dest_buff;
     int size = 1;
     int num = 1;
+    size_t iter = NR_ITER;
+    int ppn = 1;
+    char c;
     ucc_context_params_t ctx_params;
     ucc_context_config_h ctx_config;
     ucc_context_h ucc_context;
@@ -103,6 +107,26 @@ int main(int argc, char ** argv)
     ucc_status_t status;
     ucc_lib_h ucc_lib;
 
+    while ((c = getopt(argc, argv, "i:s:d:p:")) != -1) {
+        switch (c) {
+            case 's':
+                size = atoi(optarg);
+                break;
+            case 'i':
+                iter = atoi(optarg);
+                break;
+            case 'd':
+                num = atoi(optarg);
+                break;
+            case 'p':
+                ppn = atoi(optarg);
+                break;
+            default:
+                return -1;
+        }
+    }
+
+/*
     if (argc > 1) {
         size = atoi(argv[1]) / 8;
         count = size;
@@ -110,6 +134,7 @@ int main(int argc, char ** argv)
             num = atoi(argv[2]);
         }
     }
+*/
     shmem_init();
     me = shmem_my_pe();
     npes = shmem_n_pes();
@@ -240,7 +265,7 @@ int main(int argc, char ** argv)
         total = 0;
         
         /* alltoall */
-        for (int i = 0; i < NR_ITER + SKIP; i++) {
+        for (int i = 0; i < iter + SKIP; i++) {
             long * a_psync = (i % 2) ? pSync : pSync2;
             double b_start, b_end;
             ucc_coll_args_t coll_args = {
@@ -250,14 +275,14 @@ int main(int argc, char ** argv)
                 .src.info =
                     {
                         .buffer   = (void *)source,
-                        .count    = k * size,
+                        .count    = k * npes,
                         .datatype = UCC_DT_INT64,
                         .mem_type = UCC_MEMORY_TYPE_HOST,
                     },
                 .dst.info =
                     {
                         .buffer   = (void *)dest,
-                        .count    = k * size,
+                        .count    = k * npes,
                         .datatype = UCC_DT_INT64,
                         .mem_type = UCC_MEMORY_TYPE_HOST,
                     },
@@ -332,7 +357,7 @@ int main(int argc, char ** argv)
         if (me == 0) {
             printf("%-10ld", k * sizeof(uint64_t));
             printf("%-10ld", k * sizeof(uint64_t) * npes);
-            printf("%15.2f", bandwidth / (1024 * 1024));
+            printf("%15.2f", (bandwidth / (1024 * 1024)) * ppn);
             printf("%13.2f", agg_bandwidth / (1024 * 1024));
             printf("%13.2f", total_bw);
             printf("%13.2f", (total_time * 1e6) / ((NR_ITER - SKIP)));
