@@ -19,6 +19,82 @@
 #define NR_ITER     100
 #define SKIP        10
 
+// Hardware counter file paths
+#define HW_COUNTER_BASE_PATH "/sys/class/infiniband/mlx5_0/ports/1/hw_counters/"
+#define NUM_HW_COUNTERS 4
+
+const char* hw_counter_files[NUM_HW_COUNTERS] = {
+    "np_cnp_sent",
+    "rp_cnp_handled",
+    "rp_cnp_ignored",
+    "np_ecn_marked_roce_packets"
+};
+
+const char* hw_counter_names[NUM_HW_COUNTERS] = {
+    "NP CNP Sent",
+    "RP CNP Handled",
+    "RP CNP Ignored",
+    "NP ECN Marked RoCE Packets"
+};
+
+typedef struct {
+    uint64_t counters[NUM_HW_COUNTERS];
+    int hw_counters_available;
+} hw_counter_data_t;
+
+int check_hw_counters_available() {
+    char filepath[256];
+    FILE* fp;
+
+    for (int i = 0; i < NUM_HW_COUNTERS; i++) {
+        snprintf(filepath, sizeof(filepath), "%s%s", HW_COUNTER_BASE_PATH, hw_counter_files[i]);
+        fp = fopen(filepath, "r");
+        if (fp == NULL) {
+            return 0; // At least one file doesn't exist
+        }
+        fclose(fp);
+    }
+    return 1; // All files exist
+}
+
+int read_hw_counters(hw_counter_data_t* data) {
+    char filepath[256];
+    FILE* fp;
+
+    if (!data->hw_counters_available) {
+        return 0;
+    }
+
+    for (int i = 0; i < NUM_HW_COUNTERS; i++) {
+        snprintf(filepath, sizeof(filepath), "%s%s", HW_COUNTER_BASE_PATH, hw_counter_files[i]);
+        fp = fopen(filepath, "r");
+        if (fp == NULL) {
+            data->hw_counters_available = 0;
+            return 0;
+        }
+
+        if (fscanf(fp, "%lu", &data->counters[i]) != 1) {
+            fclose(fp);
+            data->hw_counters_available = 0;
+            return 0;
+        }
+        fclose(fp);
+    }
+    return 1;
+}
+
+void print_hw_counter_diff(const char* prefix, hw_counter_data_t* start, hw_counter_data_t* end) {
+    if (!start->hw_counters_available || !end->hw_counters_available) {
+        return;
+    }
+
+    printf("%s Hardware Counters:\n", prefix);
+    for (int i = 0; i < NUM_HW_COUNTERS; i++) {
+        uint64_t diff = end->counters[i] - start->counters[i];
+        printf("  %s: %lu\n", hw_counter_names[i], diff);
+    }
+}
+
 int verify(const void * src, const int64_t * dest, int64_t *src_count, ucc_aint_t *src_disp, int64_t *dst_count, ucc_aint_t *dst_disp, size_t count, int rank, int npes)
 {
     int64_t * t_dest = (int64_t *)shmem_malloc(count * npes * sizeof(int64_t));
@@ -97,6 +173,8 @@ int main(int argc, char ** argv)
     int num = 1;
     size_t iter = NR_ITER;
     int ppn = 1;
+    int monitor_hw_counters = 0;  // Flag for hardware counter monitoring
+    hw_counter_data_t hw_counters_available_check = {0};
     char c;
     ucc_context_params_t ctx_params;
     ucc_context_config_h ctx_config;
@@ -107,7 +185,7 @@ int main(int argc, char ** argv)
     ucc_status_t status;
     ucc_lib_h ucc_lib;
 
-    while ((c = getopt(argc, argv, "i:s:d:p:")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:c")) != -1) {
         switch (c) {
             case 's':
                 size = atoi(optarg);
@@ -121,20 +199,13 @@ int main(int argc, char ** argv)
             case 'p':
                 ppn = atoi(optarg);
                 break;
+            case 'c':
+                monitor_hw_counters = 1;
+                break;
             default:
                 return -1;
         }
     }
-
-/*
-    if (argc > 1) {
-        size = atoi(argv[1]) / 8;
-        count = size;
-        if (argc > 2) {
-            num = atoi(argv[2]);
-        }
-    }
-*/
     shmem_init();
     me = shmem_my_pe();
     npes = shmem_n_pes();
@@ -245,15 +316,44 @@ int main(int argc, char ** argv)
         return -1; 
     }
     shmem_barrier_all();
+
+    // Initialize hardware counter monitoring if enabled
+    if (monitor_hw_counters) {
+        hw_counters_available_check.hw_counters_available = check_hw_counters_available();
+        if (me == 0) {
+            if (hw_counters_available_check.hw_counters_available) {
+                printf("Hardware counter monitoring enabled - congestion control counters available\n");
+            } else {
+                printf("Hardware counter monitoring enabled - WARNING: congestion control counters not available, monitoring disabled\n");
+                monitor_hw_counters = 0; // Disable monitoring
+            }
+        }
+    }
+
     if (me == 0) {
-        printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size", 
-                                              "PE size",
-                                              "Bandwidth MB/s", 
-                                              "Agg MB/s",
-                                              "Max BW",
-                                              "Avg Latency", 
-                                              "Min Latency", 
-                                              "Max Latency");
+        if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+            printf("%-10s%-10s%15s%13s%13s%13s%13s%13s%15s%15s%15s%20s\n", "Size",
+                                                  "PE size",
+                                                  "Bandwidth MB/s",
+                                                  "Agg MB/s",
+                                                  "Max BW",
+                                                  "Avg Latency",
+                                                  "Min Latency",
+                                                  "Max Latency",
+                                                  "CNP Sent",
+                                                  "CNP Handled",
+                                                  "CNP Ignored",
+                                                  "ECN Marked");
+        } else {
+            printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size",
+                                                  "PE size",
+                                                  "Bandwidth MB/s",
+                                                  "Agg MB/s",
+                                                  "Max BW",
+                                                  "Avg Latency",
+                                                  "Min Latency",
+                                                  "Max Latency");
+        }
     }
 
     for (int k = 1; k <= count; k *= 2) {
@@ -263,7 +363,18 @@ int main(int argc, char ** argv)
         min = (double) INT_MAX;
         max_latency = (double) INT_MIN;
         total = 0;
-        
+
+        // Hardware counter data for this message size
+        hw_counter_data_t size_start_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
+        hw_counter_data_t size_end_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
+        hw_counter_data_t total_size_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
+
+        // Initialize total counters to zero
+        if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+            for (int i = 0; i < NUM_HW_COUNTERS; i++) {
+                total_size_counters.counters[i] = 0;
+            }
+        }
         /* alltoall */
         for (int i = 0; i < iter + SKIP; i++) {
             long * a_psync = (i % 2) ? pSync : pSync2;
@@ -302,6 +413,13 @@ int main(int argc, char ** argv)
             }
             shmem_barrier_all();
             start = MPI_Wtime();
+
+            // Start hardware counter measurement for this iteration
+            hw_counter_data_t iter_start_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
+            if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+                read_hw_counters(&iter_start_counters);
+            }
+
             for (int z = 0; z < num; z++) {
                 status = ucc_collective_post(req);
                 if (status != UCC_OK) {
@@ -321,6 +439,17 @@ int main(int argc, char ** argv)
                 shmem_barrier_all();
 #endif
             end = MPI_Wtime();
+
+            // Stop hardware counter measurement for this iteration
+            hw_counter_data_t iter_end_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
+            if (monitor_hw_counters && hw_counters_available_check.hw_counters_available && i >= SKIP) {
+                read_hw_counters(&iter_end_counters);
+                // Accumulate counter differences for valid iterations
+                for (int j = 0; j < NUM_HW_COUNTERS; j++) {
+                    total_size_counters.counters[j] += (iter_end_counters.counters[j] - iter_start_counters.counters[j]);
+                }
+            }
+
             shmem_barrier_all();
 
             #ifdef WITH_VERIFY
@@ -340,6 +469,23 @@ int main(int argc, char ** argv)
                 }
             }
             shmem_barrier_all();
+        }
+
+        // Aggregate hardware counter results across all processes
+        hw_counter_data_t global_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
+        if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+            // Initialize global counters to zero
+            for (int j = 0; j < NUM_HW_COUNTERS; j++) {
+                global_counters.counters[j] = 0;
+            }
+            // Sum hardware counters across all processes
+            for (int j = 0; j < NUM_HW_COUNTERS; j++) {
+                uint64_t local_count = total_size_counters.counters[j];
+                uint64_t global_count = 0;
+                shmem_barrier_all();
+                shmem_ulong_sum_to_all(&global_count, &local_count, 1, 0, 0, npes, (unsigned long*)pWrk, (long*)pSync3);
+                global_counters.counters[j] = global_count;
+            }
         }
 
         shmem_double_min_to_all(&min_latency, &min, 1, 0, 0, npes, pWrk, pSync3);
@@ -362,7 +508,16 @@ int main(int argc, char ** argv)
             printf("%13.2f", total_bw);
             printf("%13.2f", (total_time * 1e6) / ((NR_ITER - SKIP)));
             printf("%13.2f", min_latency * 1e6);
-            printf("%13.2f\n", max_latency * 1e6);
+            printf("%13.2f", max_latency * 1e6);
+
+            // Print hardware counter results as additional columns if monitoring is enabled
+            if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+                printf("%15lu", global_counters.counters[0]); // CNP Sent
+                printf("%15lu", global_counters.counters[1]); // CNP Handled
+                printf("%15lu", global_counters.counters[2]); // CNP Ignored
+                printf("%20lu", global_counters.counters[3]); // ECN Marked
+            }
+            printf("\n");
         }
     }
 
