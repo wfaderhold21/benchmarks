@@ -37,6 +37,8 @@ struct rdma_connection {
     uint16_t remote_lid;
     uint8_t remote_port_num;
     union ibv_gid remote_gid;
+    uint32_t remote_rkey;  // Remote memory key for RDMA operations
+    uintptr_t remote_buffer_addr;  // Remote buffer address
 };
 
 static struct rdma_context *rdma_ctx = NULL;
@@ -160,18 +162,22 @@ static int init_rdma_context(struct rdma_context *ctx, size_t buffer_size) {
     return 0;
 }
 
-// Exchange QP information between ranks
+// Exchange QP information and memory keys between ranks
 static int exchange_qp_info() {
     struct {
         uint32_t qp_num;
         uint16_t lid;
         uint8_t port_num;
         union ibv_gid gid;
+        uint32_t rkey;  // Remote key for memory access
+        uintptr_t buffer_addr;  // Buffer address for RDMA operations
     } local_info, *remote_info;
     
     local_info.qp_num = rdma_ctx->qp_num;
     local_info.lid = rdma_ctx->lid;
     local_info.port_num = rdma_ctx->port_num;
+    local_info.rkey = rdma_ctx->mr->rkey;  // Our memory region's remote key
+    local_info.buffer_addr = (uintptr_t)rdma_ctx->buffer;  // Our buffer address
     
     // Get local GID
     if (ibv_query_gid(rdma_ctx->context, rdma_ctx->port_num, 0, &local_info.gid) != 0) {
@@ -204,6 +210,8 @@ static int exchange_qp_info() {
         connections[i].remote_lid = remote_info[i].lid;
         connections[i].remote_port_num = remote_info[i].port_num;
         connections[i].remote_gid = remote_info[i].gid;
+        connections[i].remote_rkey = remote_info[i].rkey;  // Store remote memory key
+        connections[i].remote_buffer_addr = remote_info[i].buffer_addr;  // Store remote buffer address
     }
     
     free(remote_info);
@@ -298,7 +306,7 @@ static int rdma_write(int target_rank, void *local_addr, void *remote_addr, size
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.wr.rdma.remote_addr = (uintptr_t)remote_addr;
-    wr.wr.rdma.rkey = connections[target_rank].ctx->mr->rkey;
+    wr.wr.rdma.rkey = connections[target_rank].remote_rkey;  // Use remote memory key
     
     // Post send request
     ret = ibv_post_send(rdma_ctx->qp, &wr, &bad_wr);
@@ -337,8 +345,9 @@ static void rdma_alltoall(void *sendbuf, void *recvbuf, size_t msg_size) {
         
         // Send data to rank i
         if (i != my_rank) {
-            rdma_write(i, send_ptr + offset, 
-                      connections[i].ctx->buffer + my_rank * msg_size, msg_size);
+            // Calculate remote buffer address using the exchanged buffer address
+            void *remote_buffer = (void *)(connections[i].remote_buffer_addr + my_rank * msg_size);
+            rdma_write(i, send_ptr + offset, remote_buffer, msg_size);
         } else {
             // Local copy
             memcpy(recv_ptr + offset, send_ptr + offset, msg_size);

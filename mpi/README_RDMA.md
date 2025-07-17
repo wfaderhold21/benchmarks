@@ -51,13 +51,15 @@ The benchmark outputs performance metrics for each message size:
 2. **Context Creation**: Opens device context and allocates protection domain
 3. **Memory Registration**: Registers memory regions for RDMA operations
 4. **Queue Pair Creation**: Creates completion queues and queue pairs
-5. **Connection Setup**: Exchanges QP information and establishes connections
+5. **Connection Setup**: Exchanges QP information and memory keys (rkeys) between ranks
+6. **Memory Key Exchange**: Each rank shares its memory region's remote key (rkey) and buffer address
 
 ### Alltoall Algorithm
 1. Each rank sends its data to all other ranks using RDMA write operations
-2. Local data is copied directly to the receive buffer
-3. Remote data is written to the RDMA buffer and then copied to the receive buffer
-4. MPI_Barrier ensures synchronization between iterations
+2. Remote memory access is performed using exchanged memory keys (rkeys)
+3. Local data is copied directly to the receive buffer
+4. Remote data is written to the RDMA buffer and then copied to the receive buffer
+5. MPI_Barrier ensures synchronization between iterations
 
 ### Performance Measurement
 - Warmup iterations to stabilize performance

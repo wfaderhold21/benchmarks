@@ -25,6 +25,8 @@ struct rdma_context {
 struct rdma_connection {
     struct rdma_context *ctx;
     int remote_rank;
+    uint32_t remote_rkey;  // Remote memory key for RDMA operations
+    uintptr_t remote_buffer_addr;  // Remote buffer address
 };
 
 static struct rdma_context *rdma_ctx = NULL;
@@ -50,7 +52,8 @@ static int init_rdma_context(struct rdma_context *ctx, size_t buffer_size, int r
 static int rdma_write(int target_rank, void *local_addr, void *remote_addr, size_t size) {
     // In a real implementation, this would perform actual RDMA write
     // For demonstration, we'll just simulate the operation
-    printf("RDMA Write: Rank %d -> Rank %d, Size: %zu bytes\n", my_rank, target_rank, size);
+    printf("RDMA Write: Rank %d -> Rank %d, Size: %zu bytes (Remote Key: %u)\n", 
+           my_rank, target_rank, size, connections[target_rank].remote_rkey);
     
     // Simulate network delay (microseconds)
     usleep(50 + (size / 1024)); // Delay proportional to message size
