@@ -96,6 +96,29 @@ Enable verbose output by modifying the source code to add debug prints in the RD
 3. **Network Configuration**: Ensure optimal network settings for your InfiniBand fabric
 4. **CPU Affinity**: Pin processes to specific CPU cores for better performance
 
+## Scalability Considerations
+
+### No Artificial Rank Limits
+The benchmark supports **any number of ranks** - there are no artificial limits. The only constraints are:
+
+1. **System Resources**: Available memory, CPU cores, and network bandwidth
+2. **InfiniBand Hardware**: Number of available ports and QP capacity
+3. **MPI Implementation**: Maximum number of processes supported by your MPI
+
+### Practical Limits
+While there's no code limit, practical considerations include:
+
+- **Memory Usage**: Each rank allocates `num_ranks * MAX_MSG_SIZE` bytes for buffers
+- **QP Creation**: Each rank creates `(num_ranks - 1)` queue pairs
+- **Network Bandwidth**: Total bandwidth scales with `num_ranks²`
+- **Setup Time**: QP creation and connection time increases with rank count
+
+### Scaling Recommendations
+- **Small Scale (2-16 ranks)**: Direct testing, minimal setup overhead
+- **Medium Scale (16-64 ranks)**: Monitor memory usage and QP creation time
+- **Large Scale (64+ ranks)**: Consider memory-efficient algorithms and QP pooling
+- **Very Large Scale (1000+ ranks)**: May require specialized RDMA implementations
+
 ## Comparison with MPI Alltoall
 
 This benchmark can be compared with standard MPI alltoall implementations to measure the performance benefits of RDMA-based communication. 

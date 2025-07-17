@@ -22,13 +22,14 @@ struct rdma_context {
     struct ibv_pd *pd;
     struct ibv_mr *mr;
     struct ibv_cq *cq;
-    struct ibv_qp *qp;
+    struct ibv_qp **qps;  // Array of QPs, one per connection
     struct ibv_port_attr port_attr;
-    uint32_t qp_num;
+    uint32_t *qp_nums;    // Array of QP numbers
     uint16_t lid;
     uint8_t port_num;
     void *buffer;
     size_t buffer_size;
+    int num_qps;
 };
 
 struct rdma_connection {
@@ -39,6 +40,7 @@ struct rdma_connection {
     union ibv_gid remote_gid;
     uint32_t remote_rkey;  // Remote memory key for RDMA operations
     uintptr_t remote_buffer_addr;  // Remote buffer address
+    int qp_index;  // Index of the QP used for this connection
 };
 
 static struct rdma_context *rdma_ctx = NULL;
@@ -117,20 +119,13 @@ static int init_rdma_context(struct rdma_context *ctx, size_t buffer_size) {
         return -1;
     }
     
-    // Create queue pair
-    memset(&qp_init_attr, 0, sizeof(qp_init_attr));
-    qp_init_attr.qp_type = IBV_QPT_RC;
-    qp_init_attr.send_cq = ctx->cq;
-    qp_init_attr.recv_cq = ctx->cq;
-    qp_init_attr.cap.max_send_wr = 10;
-    qp_init_attr.cap.max_recv_wr = 10;
-    qp_init_attr.cap.max_send_sge = 1;
-    qp_init_attr.cap.max_recv_sge = 1;
-    qp_init_attr.cap.max_inline_data = 0;
+    // Create multiple queue pairs (one per connection)
+    ctx->num_qps = num_ranks - 1;  // We don't need a QP for ourselves
+    ctx->qps = malloc(ctx->num_qps * sizeof(struct ibv_qp*));
+    ctx->qp_nums = malloc(ctx->num_qps * sizeof(uint32_t));
     
-    ctx->qp = ibv_create_qp(ctx->pd, &qp_init_attr);
-    if (!ctx->qp) {
-        fprintf(stderr, "Failed to create queue pair\n");
+    if (!ctx->qps || !ctx->qp_nums) {
+        fprintf(stderr, "Failed to allocate QP arrays\n");
         ibv_destroy_cq(ctx->cq);
         ibv_dereg_mr(ctx->mr);
         free(ctx->buffer);
@@ -138,6 +133,37 @@ static int init_rdma_context(struct rdma_context *ctx, size_t buffer_size) {
         ibv_close_device(ctx->context);
         ibv_free_device_list(dev_list);
         return -1;
+    }
+    
+    for (int i = 0; i < ctx->num_qps; i++) {
+        memset(&qp_init_attr, 0, sizeof(qp_init_attr));
+        qp_init_attr.qp_type = IBV_QPT_RC;
+        qp_init_attr.send_cq = ctx->cq;
+        qp_init_attr.recv_cq = ctx->cq;
+        qp_init_attr.cap.max_send_wr = 10;
+        qp_init_attr.cap.max_recv_wr = 10;
+        qp_init_attr.cap.max_send_sge = 1;
+        qp_init_attr.cap.max_recv_sge = 1;
+        qp_init_attr.cap.max_inline_data = 0;
+        
+        ctx->qps[i] = ibv_create_qp(ctx->pd, &qp_init_attr);
+        if (!ctx->qps[i]) {
+            fprintf(stderr, "Failed to create queue pair %d\n", i);
+            // Cleanup previously created QPs
+            for (int j = 0; j < i; j++) {
+                ibv_destroy_qp(ctx->qps[j]);
+            }
+            free(ctx->qps);
+            free(ctx->qp_nums);
+            ibv_destroy_cq(ctx->cq);
+            ibv_dereg_mr(ctx->mr);
+            free(ctx->buffer);
+            ibv_dealloc_pd(ctx->pd);
+            ibv_close_device(ctx->context);
+            ibv_free_device_list(dev_list);
+            return -1;
+        }
+        ctx->qp_nums[i] = ctx->qps[i]->qp_num;
     }
     
     // Query port attributes
@@ -164,57 +190,94 @@ static int init_rdma_context(struct rdma_context *ctx, size_t buffer_size) {
 
 // Exchange QP information and memory keys between ranks
 static int exchange_qp_info() {
+    // First, exchange basic info to determine buffer sizes
     struct {
-        uint32_t qp_num;
         uint16_t lid;
         uint8_t port_num;
         union ibv_gid gid;
         uint32_t rkey;  // Remote key for memory access
         uintptr_t buffer_addr;  // Buffer address for RDMA operations
-    } local_info, *remote_info;
+        int num_qps;
+    } basic_info, *basic_remote_info;
     
-    local_info.qp_num = rdma_ctx->qp_num;
-    local_info.lid = rdma_ctx->lid;
-    local_info.port_num = rdma_ctx->port_num;
-    local_info.rkey = rdma_ctx->mr->rkey;  // Our memory region's remote key
-    local_info.buffer_addr = (uintptr_t)rdma_ctx->buffer;  // Our buffer address
+    basic_info.lid = rdma_ctx->lid;
+    basic_info.port_num = rdma_ctx->port_num;
+    basic_info.rkey = rdma_ctx->mr->rkey;  // Our memory region's remote key
+    basic_info.buffer_addr = (uintptr_t)rdma_ctx->buffer;  // Our buffer address
+    basic_info.num_qps = rdma_ctx->num_qps;
     
     // Get local GID
-    if (ibv_query_gid(rdma_ctx->context, rdma_ctx->port_num, 0, &local_info.gid) != 0) {
+    if (ibv_query_gid(rdma_ctx->context, rdma_ctx->port_num, 0, &basic_info.gid) != 0) {
         fprintf(stderr, "Failed to query GID\n");
         return -1;
     }
     
-    // Allocate array for remote info
-    remote_info = malloc(num_ranks * sizeof(*remote_info));
-    if (!remote_info) {
-        fprintf(stderr, "Failed to allocate remote info array\n");
+    // Allocate array for remote basic info
+    basic_remote_info = malloc(num_ranks * sizeof(*basic_remote_info));
+    if (!basic_remote_info) {
+        fprintf(stderr, "Failed to allocate remote basic info array\n");
         return -1;
     }
     
-    // Exchange information
-    MPI_Allgather(&local_info, sizeof(local_info), MPI_BYTE,
-                  remote_info, sizeof(local_info), MPI_BYTE, MPI_COMM_WORLD);
+    // Exchange basic information
+    MPI_Allgather(&basic_info, sizeof(basic_info), MPI_BYTE,
+                  basic_remote_info, sizeof(basic_info), MPI_BYTE, MPI_COMM_WORLD);
+    
+    // Now exchange QP numbers using separate messages
+    uint32_t *local_qp_nums = malloc(rdma_ctx->num_qps * sizeof(uint32_t));
+    uint32_t *all_qp_nums = malloc(num_ranks * rdma_ctx->num_qps * sizeof(uint32_t));
+    
+    if (!local_qp_nums || !all_qp_nums) {
+        fprintf(stderr, "Failed to allocate QP numbers arrays\n");
+        free(basic_remote_info);
+        free(local_qp_nums);
+        free(all_qp_nums);
+        return -1;
+    }
+    
+    // Copy our QP numbers
+    for (int i = 0; i < rdma_ctx->num_qps; i++) {
+        local_qp_nums[i] = rdma_ctx->qp_nums[i];
+    }
+    
+    // Exchange QP numbers
+    MPI_Allgather(local_qp_nums, rdma_ctx->num_qps, MPI_UINT32_T,
+                  all_qp_nums, rdma_ctx->num_qps, MPI_UINT32_T, MPI_COMM_WORLD);
     
     // Initialize connections
     connections = malloc(num_ranks * sizeof(*connections));
     if (!connections) {
         fprintf(stderr, "Failed to allocate connections array\n");
-        free(remote_info);
+        free(basic_remote_info);
+        free(local_qp_nums);
+        free(all_qp_nums);
         return -1;
     }
     
     for (int i = 0; i < num_ranks; i++) {
         connections[i].ctx = rdma_ctx;
-        connections[i].remote_qp_num = remote_info[i].qp_num;
-        connections[i].remote_lid = remote_info[i].lid;
-        connections[i].remote_port_num = remote_info[i].port_num;
-        connections[i].remote_gid = remote_info[i].gid;
-        connections[i].remote_rkey = remote_info[i].rkey;  // Store remote memory key
-        connections[i].remote_buffer_addr = remote_info[i].buffer_addr;  // Store remote buffer address
+        connections[i].remote_lid = basic_remote_info[i].lid;
+        connections[i].remote_port_num = basic_remote_info[i].port_num;
+        connections[i].remote_gid = basic_remote_info[i].gid;
+        connections[i].remote_rkey = basic_remote_info[i].rkey;  // Store remote memory key
+        connections[i].remote_buffer_addr = basic_remote_info[i].buffer_addr;  // Store remote buffer address
+        
+        // Find the appropriate QP for this connection
+        if (i < my_rank) {
+            connections[i].qp_index = i;
+            connections[i].remote_qp_num = all_qp_nums[i * rdma_ctx->num_qps + (my_rank - 1)];
+        } else if (i > my_rank) {
+            connections[i].qp_index = i - 1;
+            connections[i].remote_qp_num = all_qp_nums[i * rdma_ctx->num_qps + my_rank];
+        } else {
+            connections[i].qp_index = -1;  // No QP needed for self
+            connections[i].remote_qp_num = 0;
+        }
     }
     
-    free(remote_info);
+    free(basic_remote_info);
+    free(local_qp_nums);
+    free(all_qp_nums);
     return 0;
 }
 
@@ -226,6 +289,9 @@ static int connect_qps() {
     for (int i = 0; i < num_ranks; i++) {
         if (i == my_rank) continue;
         
+        int qp_idx = connections[i].qp_index;
+        if (qp_idx < 0) continue;  // Skip self
+        
         // Move QP to INIT state
         memset(&attr, 0, sizeof(attr));
         attr.qp_state = IBV_QPS_INIT;
@@ -234,8 +300,8 @@ static int connect_qps() {
         attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
         
         flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
-        if (ibv_modify_qp(rdma_ctx->qp, &attr, flags) != 0) {
-            fprintf(stderr, "Failed to modify QP to INIT state\n");
+        if (ibv_modify_qp(rdma_ctx->qps[qp_idx], &attr, flags) != 0) {
+            fprintf(stderr, "Failed to modify QP %d to INIT state\n", qp_idx);
             return -1;
         }
         
@@ -260,8 +326,8 @@ static int connect_qps() {
         
         flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-        if (ibv_modify_qp(rdma_ctx->qp, &attr, flags) != 0) {
-            fprintf(stderr, "Failed to modify QP to RTR state\n");
+        if (ibv_modify_qp(rdma_ctx->qps[qp_idx], &attr, flags) != 0) {
+            fprintf(stderr, "Failed to modify QP %d to RTR state\n", qp_idx);
             return -1;
         }
         
@@ -277,8 +343,8 @@ static int connect_qps() {
         
         flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
                 IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-        if (ibv_modify_qp(rdma_ctx->qp, &attr, flags) != 0) {
-            fprintf(stderr, "Failed to modify QP to RTS state\n");
+        if (ibv_modify_qp(rdma_ctx->qps[qp_idx], &attr, flags) != 0) {
+            fprintf(stderr, "Failed to modify QP %d to RTS state\n", qp_idx);
             return -1;
         }
     }
@@ -292,6 +358,13 @@ static int rdma_write(int target_rank, void *local_addr, void *remote_addr, size
     struct ibv_sge sge;
     struct ibv_wc wc;
     int ret;
+    
+    // Get the QP index for this connection
+    int qp_idx = connections[target_rank].qp_index;
+    if (qp_idx < 0) {
+        fprintf(stderr, "Invalid QP index for rank %d\n", target_rank);
+        return -1;
+    }
     
     // Prepare scatter-gather element
     memset(&sge, 0, sizeof(sge));
@@ -309,9 +382,9 @@ static int rdma_write(int target_rank, void *local_addr, void *remote_addr, size
     wr.wr.rdma.rkey = connections[target_rank].remote_rkey;  // Use remote memory key
     
     // Post send request
-    ret = ibv_post_send(rdma_ctx->qp, &wr, &bad_wr);
+    ret = ibv_post_send(rdma_ctx->qps[qp_idx], &wr, &bad_wr);
     if (ret != 0) {
-        fprintf(stderr, "Failed to post send request\n");
+        fprintf(stderr, "Failed to post send request to QP %d\n", qp_idx);
         return -1;
     }
     
@@ -326,7 +399,7 @@ static int rdma_write(int target_rank, void *local_addr, void *remote_addr, size
     }
     
     if (wc.status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "Work completion failed with status %d\n", wc.status);
+        fprintf(stderr, "Work completion failed with status %d (QP %d)\n", wc.status, qp_idx);
         return -1;
     }
     
@@ -372,8 +445,16 @@ static void cleanup_rdma() {
     }
     
     if (rdma_ctx) {
-        if (rdma_ctx->qp) {
-            ibv_destroy_qp(rdma_ctx->qp);
+        if (rdma_ctx->qps) {
+            for (int i = 0; i < rdma_ctx->num_qps; i++) {
+                if (rdma_ctx->qps[i]) {
+                    ibv_destroy_qp(rdma_ctx->qps[i]);
+                }
+            }
+            free(rdma_ctx->qps);
+        }
+        if (rdma_ctx->qp_nums) {
+            free(rdma_ctx->qp_nums);
         }
         if (rdma_ctx->cq) {
             ibv_destroy_cq(rdma_ctx->cq);
