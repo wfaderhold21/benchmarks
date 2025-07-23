@@ -184,6 +184,8 @@ int main(int argc, char ** argv)
     ucc_team_params_t team_params;
     ucc_status_t status;
     ucc_lib_h ucc_lib;
+    static uint64_t local_count = 0;
+    static uint64_t global_count = 0;
 
     while ((c = getopt(argc, argv, "i:s:d:p:c")) != -1) {
         switch (c) {
@@ -411,14 +413,14 @@ int main(int argc, char ** argv)
                 printf("coll init failed\n");
                 return -1;
             }
-            shmem_barrier_all();
-            start = MPI_Wtime();
-
             // Start hardware counter measurement for this iteration
             hw_counter_data_t iter_start_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
             if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
                 read_hw_counters(&iter_start_counters);
             }
+
+            shmem_barrier_all();
+            start = MPI_Wtime();
 
             for (int z = 0; z < num; z++) {
                 status = ucc_collective_post(req);
@@ -480,10 +482,10 @@ int main(int argc, char ** argv)
             }
             // Sum hardware counters across all processes
             for (int j = 0; j < NUM_HW_COUNTERS; j++) {
-                uint64_t local_count = total_size_counters.counters[j];
-                uint64_t global_count = 0;
+                local_count = total_size_counters.counters[j];
+                global_count = 0;
                 shmem_barrier_all();
-                shmem_ulong_sum_to_all(&global_count, &local_count, 1, 0, 0, npes, (unsigned long*)pWrk, (long*)pSync3);
+                shmem_long_sum_to_all(&global_count, &local_count, 1, 0, 0, npes, (unsigned long*)pWrk, (long*)pSync3);
                 global_counters.counters[j] = global_count;
             }
         }
