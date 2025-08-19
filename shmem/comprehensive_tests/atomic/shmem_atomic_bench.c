@@ -369,6 +369,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    /* Verify PE connectivity before starting benchmarks */
+    if (!verify_pe_connectivity()) {
+        if (my_pe == 0) {
+            fprintf(stderr, COLOR_RED "PE connectivity test failed\n" COLOR_RESET);
+        }
+        shmem_finalize();
+        return 1;
+    }
+
     test_config_t config = default_config;
     
     /* Parse command line arguments */
@@ -377,9 +386,19 @@ int main(int argc, char* argv[]) {
             config.iterations = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             config.warmup = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            config.timeout_seconds = atoi(argv[++i]);
         }
     }
     
+    /* Start test timer */
+    start_test_timer();
+
+    if (my_pe == 0) {
+        printf(COLOR_BLUE "[INFO] Starting benchmarks with %d second timeout\n" COLOR_RESET,
+               config.timeout_seconds);
+    }
+
     print_atomic_header();
     
     /* Run all atomic operation benchmarks */
@@ -399,4 +418,4 @@ int main(int argc, char* argv[]) {
     
     shmem_finalize();
     return 0;
-} 
+}

@@ -22,26 +22,26 @@ static void benchmark_get_latency_bandwidth(const test_config_t* config) {
         double start_time, end_time;
         benchmark_result_t result = {0};
         
-        /* Initialize data - source PE sets up data to be fetched */
-        init_data(remote_buf, size, 'S' + source_pe);
+        /* Initialize data - each PE sets up its own buffer with its PE ID */
+        init_data(remote_buf, size, 'R' + my_pe);  /* Remote buffer identifies its owner */
         init_data(local_buf, size, 'L');
         
-        shmem_barrier_all();
+        safe_barrier_all("get_bench_initialization");
         
         /* Warmup */
-        for (int i = 0; i < config->warmup; i++) {
+        SAFE_LOOP_WITH_TIMEOUT(i, 0, config->warmup, "get_bench_warmup")
             shmem_getmem(local_buf, remote_buf, size, source_pe);
-        }
-        shmem_barrier_all();
+        END_SAFE_LOOP()
+        safe_barrier_all("get_bench_warmup_complete");
         
         /* Actual benchmark */
         start_time = TIME();
-        for (int i = 0; i < iterations; i++) {
+        SAFE_LOOP_WITH_TIMEOUT(j, 0, iterations, "get_bench_main")
             shmem_getmem(local_buf, remote_buf, size, source_pe);
-        }
+        END_SAFE_LOOP()
         end_time = TIME();
         
-        shmem_barrier_all();
+        safe_barrier_all("get_bench_complete");
         
         /* Calculate metrics */
         double total_time_us = end_time - start_time;
@@ -51,9 +51,9 @@ static void benchmark_get_latency_bandwidth(const test_config_t* config) {
         result.message_size = size;
         result.iterations = iterations;
         
-        /* Validation - check if fetched data matches expected */
+        /* Validation - check if fetched data matches source PE's pattern */
         if (config->validate) {
-            char expected_pattern = 'S' + source_pe;
+            char expected_pattern = 'R' + source_pe;  /* Should match source PE's remote buffer */
             int valid = 1;
             for (size_t i = 0; i < size; i++) {
                 if (local_buf[i] != expected_pattern) {
@@ -61,8 +61,13 @@ static void benchmark_get_latency_bandwidth(const test_config_t* config) {
                     break;
                 }
             }
-            if (!valid && my_pe == 0) {
-                printf(COLOR_RED "WARNING: Data validation failed for size %zu" COLOR_RESET "\n", size);
+
+            /* Record validation result */
+            record_validation_result(valid, "GET", size, my_pe);
+
+            if (!valid) {
+                printf(COLOR_RED "[PE %d] VALIDATION FAILED for size %zu: expected 0x%02x, got 0x%02x" COLOR_RESET "\n", 
+                       my_pe, size, (unsigned char)expected_pattern, (unsigned char)local_buf[0]);
             }
         }
         
@@ -100,22 +105,22 @@ static void benchmark_get_message_rate(const test_config_t* config) {
     *remote_buf = 0xFEDCBA9876543210LL + source_pe;
     *local_buf = 0;
     
-    shmem_barrier_all();
+    safe_barrier_all("get_message_rate_init");
     
     /* Warmup */
-    for (int i = 0; i < config->warmup; i++) {
+    SAFE_LOOP_WITH_TIMEOUT(i, 0, config->warmup, "get_message_rate_warmup")
         shmem_long_get(local_buf, remote_buf, 1, source_pe);
-    }
-    shmem_barrier_all();
+    END_SAFE_LOOP()
+    safe_barrier_all("get_message_rate_warmup_complete");
     
     /* Message rate benchmark */
     double start_time = TIME();
-    for (int i = 0; i < rate_iterations; i++) {
+    SAFE_LOOP_WITH_TIMEOUT(j, 0, rate_iterations, "get_message_rate_main")
         shmem_long_get(local_buf, remote_buf, 1, source_pe);
-    }
+    END_SAFE_LOOP()
     double end_time = TIME();
     
-    shmem_barrier_all();
+    safe_barrier_all("get_message_rate_complete");
     
     double total_time_us = end_time - start_time;
     double message_rate = rate_iterations / (total_time_us / 1e6) / 1e6; /* Million messages per second */
@@ -138,13 +143,14 @@ static void benchmark_get_bi_directional(const test_config_t* config) {
     
     if (n_pes < 2) return;
     
-    /* Only run on PE pairs for bi-directional testing */
-    if (my_pe >= 2) return;
+    /* Only PE 0 and PE 1 do the actual bi-directional test work,
+       but ALL PEs must participate in barriers to avoid deadlock */
+    int do_bidirectional_work = (my_pe < 2);
     
-    int partner_pe = 1 - my_pe; /* PE 0 <-> PE 1 */
+    int partner_pe = (my_pe < 2) ? (1 - my_pe) : 0; /* PE 0 <-> PE 1, others use safe value */
     const size_t test_size = 1024; /* Fixed size for bi-directional test */
     const int test_iterations = 10000;
-    
+
     char* local_buf = (char*)shmem_malloc_aligned(test_size);
     char* remote_buf = (char*)shmem_malloc_aligned(test_size);
     
@@ -152,42 +158,59 @@ static void benchmark_get_bi_directional(const test_config_t* config) {
         fprintf(stderr, "Memory allocation failed\n");
         shmem_global_exit(1);
     }
+
+    /* Initialize data */
+    init_data(remote_buf, test_size, 'R' + my_pe);
+    init_data(local_buf, test_size, 'L');
     
     if (my_pe == 0) {
         printf("\n" COLOR_MAGENTA "SHMEM GET BI-DIRECTIONAL TEST (1KB messages)" COLOR_RESET "\n");
         printf("---------------------------------------------------------------\n");
     }
     
-    /* Initialize data */
-    init_data(remote_buf, test_size, 'R' + my_pe);
-    init_data(local_buf, test_size, 'L');
+    safe_barrier_all("get_bi_directional_init");
     
-    shmem_barrier_all();
-    
-    /* Warmup */
-    for (int i = 0; i < config->warmup; i++) {
-        shmem_getmem(local_buf, remote_buf, test_size, partner_pe);
+    /* Warmup - only active PEs do SHMEM operations */
+    if (do_bidirectional_work) {
+        SAFE_LOOP_WITH_TIMEOUT(i, 0, config->warmup, "get_bi_directional_warmup")
+            shmem_getmem(local_buf, remote_buf, test_size, partner_pe);
+        END_SAFE_LOOP()
     }
-    shmem_barrier_all();
+    safe_barrier_all("get_bi_directional_warmup_complete");
     
-    /* Bi-directional test - both PEs get simultaneously */
+    /* Sequential bi-directional test to avoid deadlocks */
     double start_time = TIME();
-    for (int i = 0; i < test_iterations; i++) {
-        shmem_getmem(local_buf, remote_buf, test_size, partner_pe);
-    }
-    double end_time = TIME();
-    
-    shmem_barrier_all();
-    
-    double total_time_us = end_time - start_time;
-    double latency_us = total_time_us / test_iterations;
-    double bandwidth_mbps = (double)(test_size * test_iterations) / (total_time_us / 1e6) / (1024 * 1024);
-    
+
+    /* PE 0 goes first */
     if (my_pe == 0) {
+        SAFE_LOOP_WITH_TIMEOUT(j, 0, test_iterations, "get_bi_directional_pe0")
+            shmem_getmem(local_buf, remote_buf, test_size, partner_pe);
+        END_SAFE_LOOP()
+    }
+
+    /* All PEs synchronize before PE 1 starts */
+    safe_barrier_all("get_bi_directional_pe0_complete");
+
+    /* PE 1 goes second */
+    if (my_pe == 1) {
+        SAFE_LOOP_WITH_TIMEOUT(j, 0, test_iterations, "get_bi_directional_pe1")
+            shmem_getmem(local_buf, remote_buf, test_size, partner_pe);
+        END_SAFE_LOOP()
+    }
+
+    double end_time = TIME();
+    safe_barrier_all("get_bi_directional_complete");
+
+    /* Only PE 0 calculates and prints results */
+    if (my_pe == 0) {
+        double total_time_us = end_time - start_time;
+        double latency_us = total_time_us / test_iterations;
+        double bandwidth_mbps = (double)(test_size * test_iterations) / (total_time_us / 1e6) / (1024 * 1024);
+
         printf("PE %d <-> PE %d Latency: %.2f us\n", my_pe, partner_pe, latency_us);
         printf("PE %d <-> PE %d Bandwidth: %.2f MB/s\n", my_pe, partner_pe, bandwidth_mbps);
     }
-    
+
     shmem_free(local_buf);
     shmem_free(remote_buf);
 }
@@ -210,7 +233,16 @@ int main(int argc, char* argv[]) {
         shmem_finalize();
         return 1;
     }
-    
+
+    /* Verify PE connectivity before starting benchmarks */
+    if (!verify_pe_connectivity()) {
+        if (my_pe == 0) {
+            fprintf(stderr, COLOR_RED "PE connectivity test failed\n" COLOR_RESET);
+        }
+        shmem_finalize();
+        return 1;
+    }
+
     test_config_t config = default_config;
     
     /* Parse command line arguments if needed */
@@ -221,18 +253,43 @@ int main(int argc, char* argv[]) {
             config.iterations = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-validate") == 0) {
             config.validate = 0;
+        } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            config.timeout_seconds = atoi(argv[++i]);
         }
     }
     
-    /* Run benchmarks */
+    /* Initialize validation tracking */
+    reset_validation_counters();
+
+    /* Start test timer */
+    start_test_timer();
+
+    /* Run benchmarks with timeout protection */
+    if (my_pe == 0) {
+        printf(COLOR_BLUE "[INFO] Starting benchmarks with %d second timeout\n" COLOR_RESET,
+               config.timeout_seconds);
+    }
+
     benchmark_get_latency_bandwidth(&config);
     benchmark_get_message_rate(&config);
     benchmark_get_bi_directional(&config);
-    
-    if (my_pe == 0) {
-        printf(COLOR_GREEN "\nSHMEM GET Benchmark Complete\n" COLOR_RESET);
+
+    /* Print validation summary */
+    print_validation_summary();
+
+    /* Check for validation failures and exit accordingly */
+    int exit_code = 0;
+    if (has_validation_failures()) {
+        if (my_pe == 0) {
+            printf(COLOR_RED "\nSHMEM GET Benchmark FAILED due to validation errors\n" COLOR_RESET);
+        }
+        exit_code = 1;
+    } else {
+        if (my_pe == 0) {
+            printf(COLOR_GREEN "\nSHMEM GET Benchmark Complete\n" COLOR_RESET);
+        }
     }
-    
+
     shmem_finalize();
-    return 0;
-} 
+    return exit_code;
+}

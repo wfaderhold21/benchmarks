@@ -126,12 +126,23 @@ run_benchmark() {
     local output_file="$RESULTS_DIR/${test_name}_${pe_count}pe.out"
     local error_file="$RESULTS_DIR/${test_name}_${pe_count}pe.err"
     
-    if timeout 300 $SHMEM_LAUNCHER -np $pe_count $executable $args > "$output_file" 2> "$error_file"; then
+    if timeout --preserve-status --signal=TERM --kill-after=30s 120 $SHMEM_LAUNCHER -np $pe_count $executable $args > "$output_file" 2> "$error_file"; then
         print_success "$test_name ($pe_count PEs) completed"
         return 0
     else
         local exit_code=$?
-        print_error "$test_name ($pe_count PEs) failed with exit code $exit_code"
+        if [ $exit_code -eq 124 ]; then
+            print_error "$test_name ($pe_count PEs) TIMEOUT after 120 seconds"
+            # Try to clean up any stuck processes
+            pkill -f "$executable" 2>/dev/null || true
+            sleep 2
+            pkill -9 -f "$executable" 2>/dev/null || true
+        elif [ $exit_code -eq 137 ]; then
+            print_error "$test_name ($pe_count PEs) KILLED by timeout"
+        else
+            print_error "$test_name ($pe_count PEs) failed with exit code $exit_code"
+        fi
+
         if [ -s "$error_file" ]; then
             print_error "Error output:"
             cat "$error_file"
@@ -325,8 +336,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Set up signal handling
+# Enhanced cleanup function
+cleanup() {
+    print_info "Cleaning up..."
+
+    # Kill any remaining SHMEM processes
+    pkill -f "shmem.*bench" 2>/dev/null || true
+    pkill -f "shmrun" 2>/dev/null || true
+    pkill -f "mpirun.*shmem" 2>/dev/null || true
+
+    # Wait a bit then force kill if needed
+    sleep 2
+    pkill -9 -f "shmem.*bench" 2>/dev/null || true
+    pkill -9 -f "shmrun" 2>/dev/null || true
+    pkill -9 -f "mpirun.*shmem" 2>/dev/null || true
+
+    print_info "Cleanup complete"
+}
+
+# Enhanced signal handling
 trap cleanup EXIT
+trap 'print_error "Interrupted by user"; cleanup; exit 130' INT
+trap 'print_error "Terminated"; cleanup; exit 143' TERM
 
 # Main execution
 main() {
