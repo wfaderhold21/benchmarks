@@ -11,6 +11,12 @@
  *
  * Ported to OpenSHMEM by:
  *    [Your Name]
+ *
+ * Debug Output:
+ *   Compile with DEBUG=1 to enable verbose debug output:
+ *   make DEBUG=1
+ *   or
+ *   gcc -DDEBUG=1 -o cg_poisson_3d_oshmem cg_poisson_3d_oshmem.c
  */
 
 #include <stdio.h>
@@ -22,6 +28,13 @@
 #include <mpi.h>
 #include <math.h>
 #include <sys/time.h>
+
+/* Debug macro - compile with DEBUG=1 to enable debug output */
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
+#define DEBUG_PRINT(fmt, ...) do { if (DEBUG) printf(fmt, ##__VA_ARGS__); } while(0)
 
 /* ugly global variables */
 double gt1, gt2, gt3, gt4;
@@ -72,7 +85,12 @@ struct comm_data_t
   int                dims[3];
   int                coords[3];
   shmem_req_h        req;  /* OpenSHMEM request handle for non-blocking operations */
+  /* Buffer management for non-blocking operations */
+  double            *padded_send;
+  double            *padded_recv;
+  size_t            nelems;
 };
+struct comm_data_t    comm_data;
 
 /* =========
    Functions
@@ -153,7 +171,20 @@ void alloc_buffer_set(struct buffer_set *bs, struct grid_info *gi, struct array_
     total+= z_plane_size(a);
   }
   
-  bs->start= (double*) shmem_malloc(total * sizeof(double)); 
+  if (total > 0) {
+    bs->start = (double*) shmem_malloc(total * sizeof(double) * comm_data.npes);
+    if (bs->start == NULL) {
+      printf("Error: Failed to allocate buffer of size %zu bytes\n", total * sizeof(double) * comm_data.npes);
+      shmem_finalize();
+      exit(1);
+    }
+    
+    if (comm_data.rank == 0) {
+      DEBUG_PRINT("Buffer allocation: %d elements, %zu bytes per PE\n", total, total * sizeof(double));
+    }
+  } else {
+    bs->start = NULL;
+  } 
 }
 
 static inline double av(struct array_3d *a, int x, int y, int z)
@@ -269,7 +300,12 @@ void init_array_3d(struct array_3d *a, int xd, int yd, int zd)
   a->y_dim= yd;
   a->z_dim= zd;
   a->z_inc= xd * yd;
-  a->array= (double*) shmem_malloc(vector_size(a) * sizeof(double));
+  a->array = (double*) shmem_malloc(vector_size(a) * sizeof(double) * comm_data.npes);
+  if (a->array == NULL) {
+    printf("Error: Failed to allocate array of size %zu bytes\n", vector_size(a) * sizeof(double) * comm_data.npes);
+    shmem_finalize();
+    exit(1);
+  }
 }
 
 void iota_array_3d(struct array_3d *a)
@@ -318,6 +354,9 @@ void volume_mult(struct array_3d *v_in, struct array_3d *v_out, struct comm_data
   check_same_dimensions(v_in, v_out);
 
   /* multiply inner volume */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Multiplying inner volume in volume_mult...\n");
+  }
   for (z= 1; z < z_dim - 1; z++) {
     for (y= 1; y < y_dim - 1; y++) {
       for (x= 1; x < x_dim - 1; x++) {
@@ -334,6 +373,9 @@ void volume_mult(struct array_3d *v_in, struct array_3d *v_out, struct comm_data
   }
 
   /* multiply boundaries */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Multiplying boundaries in volume_mult...\n");
+  }
   mult_boundaries(v_in, &comm_data->recv_buffers);
 }
 
@@ -405,6 +447,10 @@ void init_processor_grid(struct comm_data_t *comm_data)
   int coords[3];
   int rank = comm_data->rank;
   int npes = comm_data->npes;
+  
+  if (rank == 0) {
+    DEBUG_PRINT("Initializing processor grid for %d PEs\n", npes);
+  }
 
   /* Find the best 3D grid */
   dims[0] = dims[1] = dims[2] = 0;
@@ -425,6 +471,10 @@ void init_processor_grid(struct comm_data_t *comm_data)
   comm_data->dims[0] = dims[0];
   comm_data->dims[1] = dims[1];
   comm_data->dims[2] = dims[2];
+  
+  if (rank == 0) {
+    DEBUG_PRINT("Processor grid: %d x %d x %d\n", dims[0], dims[1], dims[2]);
+  }
 
   /* Calculate my coordinates */
   coords[0] = rank % dims[0];
@@ -434,6 +484,10 @@ void init_processor_grid(struct comm_data_t *comm_data)
   comm_data->coords[0] = coords[0];
   comm_data->coords[1] = coords[1];
   comm_data->coords[2] = coords[2];
+  
+  if (rank == 0) {
+    DEBUG_PRINT("PE coordinates: (%d, %d, %d)\n", coords[0], coords[1], coords[2]);
+  }
 
   /* Find neighbors */
   comm_data->info.left = nb_rank(rank, 0, -1, dims, coords);
@@ -442,6 +496,12 @@ void init_processor_grid(struct comm_data_t *comm_data)
   comm_data->info.back = nb_rank(rank, 1, 1, dims, coords);
   comm_data->info.top = nb_rank(rank, 2, -1, dims, coords);
   comm_data->info.bottom = nb_rank(rank, 2, 1, dims, coords);
+  
+  if (rank == 0) {
+    DEBUG_PRINT("Neighbors: left=%d, right=%d, front=%d, back=%d, top=%d, bottom=%d\n",
+           comm_data->info.left, comm_data->info.right, comm_data->info.front,
+           comm_data->info.back, comm_data->info.top, comm_data->info.bottom);
+  }
 }
 
 void fill_buffers(struct array_3d *v, struct buffer_set *send_buffers)
@@ -449,6 +509,13 @@ void fill_buffers(struct array_3d *v, struct buffer_set *send_buffers)
   struct plane    v_left_plane, v_right_plane, v_front_plane, v_back_plane,
                   v_top_plane, v_bottom_plane;
   int             offset;
+
+  /* Check if buffer is allocated */
+  if (send_buffers->start == NULL) {
+    printf("Error: send_buffers->start is NULL\n");
+    shmem_finalize();
+    exit(1);
+  }
 
   if (send_buffers->left) {
     left_plane(v, &v_left_plane);
@@ -500,12 +567,24 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
 
   /* Find maximum elements across all PEs */
   shmem_long_max_to_all(&max_nelems, (long*)&nelems, 1, 0, 0, comm_data->npes, max_pWrk, max_pSync);
-
+  
+  /* Add debug output for large problems */
+  if (comm_data->rank == 0 && max_nelems > 100000) {
+    DEBUG_PRINT("Warning: Large buffer size: %ld elements\n", max_nelems);
+    DEBUG_PRINT("Buffer size in MB: %.2f\n", (double)(max_nelems * sizeof(double) * comm_data->npes) / (1024*1024));
+  }
 
   /* Allocate new padded buffers */
   padded_send = (double*) shmem_malloc(max_nelems * sizeof(double));
-  padded_recv = (double*) shmem_malloc(max_nelems * sizeof(double));
+  padded_recv = (double*) shmem_malloc(max_nelems * sizeof(double) * comm_data->npes);
   padded_size = max_nelems;
+  
+  /* Check if allocation succeeded */
+  if (padded_send == NULL || padded_recv == NULL) {
+    printf("Error: Failed to allocate communication buffers of size %ld\n", max_nelems);
+    shmem_finalize();
+    exit(1);
+  }
 
   /* Copy data to padded buffer and zero out the rest */
   memcpy(padded_send, comm_data->send_buffers.start, nelems * sizeof(double));
@@ -518,6 +597,11 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
                       padded_send,                    /* source */
                       max_nelems,                     /* nelems */
                       &comm_data->req);              /* req */
+    
+    /* For non-blocking, store buffer pointers for later cleanup */
+    comm_data->padded_send = padded_send;
+    comm_data->padded_recv = padded_recv;
+    comm_data->nelems = nelems;
   } else {
     /* Use blocking alltoall for boundary exchange */
     shmem_alltoall64(padded_recv,                    /* target */
@@ -527,17 +611,17 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
                     0,                               /* logPE_stride */
                     comm_data->npes,                 /* PE_size */
                     pSync);                          /* pSync */
+    
+    /* Copy received data back to original buffer for blocking version */
+    memcpy(comm_data->recv_buffers.start, padded_recv, nelems * sizeof(double) * comm_data->npes);
+    
+    /* Free buffers for blocking version */
+    shmem_free(padded_send);
+    shmem_free(padded_recv);
   }
-
-  /* Copy received data back to original buffer */
-  memcpy(comm_data->recv_buffers.start, padded_recv, nelems * sizeof(double));
 
   t2 = MPI_Wtime();
   gt1 += t2 - t1;
-  /* Free old buffers */
-  shmem_free(padded_send);
-  shmem_free(padded_recv);
-
 }
 
 void finish_send_boundaries(struct comm_data_t *comm_data)
@@ -548,6 +632,13 @@ void finish_send_boundaries(struct comm_data_t *comm_data)
   if (comm_data->non_blocking) {
     /* Wait for non-blocking alltoall to complete */
     shmem_req_wait(&comm_data->req);
+    
+    /* Now safe to copy data and free buffers */
+    memcpy(comm_data->recv_buffers.start, comm_data->padded_recv, comm_data->nelems * sizeof(double) * comm_data->npes);
+    
+    /* Free buffers after data is copied */
+    shmem_free(comm_data->padded_send);
+    shmem_free(comm_data->padded_recv);
   }
   
   t2 = MPI_Wtime();
@@ -558,6 +649,13 @@ void mult_boundaries(struct array_3d *v, struct buffer_set *recv_buffers)
 {
   struct plane    v_left_plane, v_right_plane, v_front_plane, v_back_plane,
                   v_top_plane, v_bottom_plane;
+
+  /* Check if buffer is allocated */
+  if (recv_buffers->start == NULL) {
+    printf("Error: recv_buffers->start is NULL\n");
+    shmem_finalize();
+    exit(1);
+  }
 
   if (recv_buffers->left) {
     left_plane(v, &v_left_plane);
@@ -597,12 +695,21 @@ void matrix_vector_mult(struct array_3d *v_in, struct array_3d *v_out,
   volume_mult_simple(v_in, v_out);
 
   /* exchange boundaries */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Starting boundary exchange...\n");
+  }
   start_send_boundaries(v_in, comm_data);
 
   /* multiply boundaries */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Multiplying boundaries in matrix_vector_mult...\n");
+  }
   mult_boundaries(v_in, &comm_data->recv_buffers);
 
   /* wait for all communication to complete */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Waiting for communication to complete...\n");
+  }
   finish_send_boundaries(comm_data);
 
   t2 = MPI_Wtime();
@@ -632,6 +739,11 @@ void allocate_vectors(struct array_3d *x, struct array_3d *b, int argc, char** a
   nx= atoi(argv[1]);
   ny= atoi(argv[2]);
   nz= atoi(argv[3]);
+  
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Problem size: %d x %d x %d\n", nx, ny, nz);
+    DEBUG_PRINT("Total global elements: %d\n", nx * ny * nz);
+  }
 
   x_dim= nth_block_size(comm_data->coords[0], comm_data->dims[0], nx);
   y_dim= nth_block_size(comm_data->coords[1], comm_data->dims[1], ny);
@@ -639,6 +751,11 @@ void allocate_vectors(struct array_3d *x, struct array_3d *b, int argc, char** a
 
   init_array_3d(x, x_dim, y_dim, z_dim);
   init_array_3d(b, x_dim, y_dim, z_dim);
+  
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Local dimensions: x=%d, y=%d, z_dim=%d\n", x_dim, y_dim, z_dim);
+    DEBUG_PRINT("Total local elements: %d\n", x_dim * y_dim * z_dim);
+  }
 }
 
 void init_vectors(struct array_3d *x, struct array_3d *b, struct comm_data_t *comm_data)
@@ -675,16 +792,23 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
   struct array_3d       v, q, r;
   double               alpha, beta, rho, rho_old;
   int                  i;
-  int                  max_iter= 1000;
+  int                  max_iter= 200;
   double               t1, t2;
 
   t1 = MPI_Wtime();
+
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Initializing conjugate gradient arrays...\n");
+  }
 
   init_array_3d(&v, x->x_dim, x->y_dim, x->z_dim);
   init_array_3d(&q, x->x_dim, x->y_dim, x->z_dim);
   init_array_3d(&r, x->x_dim, x->y_dim, x->z_dim);
 
   /* r = b - A x */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Calculating initial residual...\n");
+  }
   matrix_vector_mult(x, &v, comm_data);
   set_array_3d(&r, 0.0);
   vector_assign_add(&r, b);
@@ -693,20 +817,42 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
   /* v = r */
   memcpy(v.array, r.array, vector_size(&r) * sizeof(double));
 
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Calculating initial rho...\n");
+  }
   rho= parallel_dot(&r, &r, comm_data);
 
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Starting main iteration loop...\n");
+  }
+
   for (i= 0; i < max_iter; i++) {
+    if (i % 100 == 0 && comm_data->rank == 0) {
+      DEBUG_PRINT("Iteration %d: starting matrix-vector multiply...\n", i);
+    }
     matrix_vector_mult(&v, &q, comm_data);
     alpha= rho / parallel_dot(&v, &q, comm_data);
     vector_assign_add(x, &v);
     vector_assign_add(&r, &q);
     rho_old= rho;
     rho= parallel_dot(&r, &r, comm_data);
+    
+    if (i % 100 == 0 && comm_data->rank == 0) {
+      DEBUG_PRINT("Iteration %d: residual = %e\n", i, sqrt(rho));
+    }
+    
     if (sqrt(rho) < rel_error) {
+      if (comm_data->rank == 0) {
+        DEBUG_PRINT("Converged at iteration %d with residual %e\n", i, sqrt(rho));
+      }
       break;
     }
     beta= rho / rho_old;
     vector_assign_add(&v, &r);
+  }
+  
+  if (i >= max_iter && comm_data->rank == 0) {
+    DEBUG_PRINT("Warning: Maximum iterations (%d) reached without convergence\n", max_iter);
   }
 
   shmem_free(v.array);
@@ -716,13 +862,17 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
   t2 = MPI_Wtime();
   gt4 += t2 - t1;
 
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Conjugate gradient completed in %d iterations\n", i);
+  }
+
   return i;
 }
 
 int main(int argc, char** argv) 
 {
   struct array_3d       x, b;
-  struct comm_data_t    comm_data;
+//  struct comm_data_t    comm_data;
   int                   iter;
   double                rel_error= 1.0e-6;
   double                t1, t2, t3, t4;
@@ -733,8 +883,17 @@ int main(int argc, char** argv)
 
   shmem_init();
 
+  if (shmem_my_pe() == 0) {
+    DEBUG_PRINT("Starting CG Poisson 3D solver...\n");
+  }
+
   comm_data.rank = shmem_my_pe();
   comm_data.npes = shmem_n_pes();
+  
+  /* Initialize buffer management fields */
+  comm_data.padded_send = NULL;
+  comm_data.padded_recv = NULL;
+  comm_data.nelems = 0;
 
   /* Initialize timing variables */
   gt1 = gt2 = gt3 = gt4 = 0.0;
@@ -748,6 +907,9 @@ int main(int argc, char** argv)
   }
 
   /* First run with blocking version */
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("\n=== Starting Blocking Version ===\n");
+  }
   comm_data.non_blocking = 0;
   t1 = MPI_Wtime();
 
@@ -756,10 +918,17 @@ int main(int argc, char** argv)
   allocate_buffers(&comm_data, &x);
   init_vectors(&x, &b, &comm_data);
 
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("Starting blocking conjugate gradient iterations...\n");
+  }
   iter = conjugate_gradient(&b, &x, rel_error, &comm_data);
 
   t2 = MPI_Wtime();
   blocking_time = t2 - t1;
+  
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("Blocking version completed in %.6f seconds\n", blocking_time);
+  }
 
   /* Save blocking timing values */
   blocking_gt1 = gt1;
@@ -768,6 +937,9 @@ int main(int argc, char** argv)
   blocking_gt4 = gt4;
 
   /* Free resources */
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("Cleaning up blocking version resources...\n");
+  }
   shmem_free(x.array);
   shmem_free(b.array);
   shmem_free(comm_data.send_buffers.start);
@@ -777,6 +949,9 @@ int main(int argc, char** argv)
   gt1 = gt2 = gt3 = gt4 = 0.0;
 
   /* Now run with non-blocking version */
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("\n=== Starting Non-Blocking Version ===\n");
+  }
   comm_data.non_blocking = 1;
   t3 = MPI_Wtime();
 
@@ -785,10 +960,17 @@ int main(int argc, char** argv)
   allocate_buffers(&comm_data, &x);
   init_vectors(&x, &b, &comm_data);
 
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("Starting non-blocking conjugate gradient iterations...\n");
+  }
   iter = conjugate_gradient(&b, &x, rel_error, &comm_data);
 
   t4 = MPI_Wtime();
   nonblocking_time = t4 - t3;
+  
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("Non-blocking version completed in %.6f seconds\n", nonblocking_time);
+  }
 
   /* Save non-blocking timing values */
   nonblocking_gt1 = gt1;
@@ -797,6 +979,11 @@ int main(int argc, char** argv)
   nonblocking_gt4 = gt4;
 
   if (comm_data.rank == 0) {
+    DEBUG_PRINT("Cleaning up non-blocking version resources...\n");
+  }
+
+  if (comm_data.rank == 0) {
+    printf("\n=== Results ===\n");
     printf("Converged after %i iterations\n", iter);
     printf("\nBlocking version:\n");
     printf("  Boundary exchange start: %f seconds\n", blocking_gt1);
@@ -817,6 +1004,10 @@ int main(int argc, char** argv)
   shmem_free(b.array);
   shmem_free(comm_data.send_buffers.start);
   shmem_free(comm_data.recv_buffers.start);
+
+  if (comm_data.rank == 0) {
+    DEBUG_PRINT("\n=== Program Complete ===\n");
+  }
 
   shmem_finalize();
   return 0;
