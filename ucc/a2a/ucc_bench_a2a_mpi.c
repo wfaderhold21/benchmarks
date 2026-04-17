@@ -19,8 +19,6 @@
 #define NR_ITER     100
 #define SKIP        10
 
-// Hardware counter file paths
-#define HW_COUNTER_BASE_PATH "/sys/class/infiniband/mlx5_0/ports/1/hw_counters/"
 #define NUM_HW_COUNTERS 4
 
 const char* hw_counter_files[NUM_HW_COUNTERS] = {
@@ -42,22 +40,22 @@ typedef struct {
     int hw_counters_available;
 } hw_counter_data_t;
 
-int check_hw_counters_available() {
+int check_hw_counters_available(const char *base_path) {
     char filepath[256];
     FILE* fp;
 
     for (int i = 0; i < NUM_HW_COUNTERS; i++) {
-        snprintf(filepath, sizeof(filepath), "%s%s", HW_COUNTER_BASE_PATH, hw_counter_files[i]);
+        snprintf(filepath, sizeof(filepath), "%s%s", base_path, hw_counter_files[i]);
         fp = fopen(filepath, "r");
         if (fp == NULL) {
-            return 0; // At least one file doesn't exist
+            return 0;
         }
         fclose(fp);
     }
-    return 1; // All files exist
+    return 1;
 }
 
-int read_hw_counters(hw_counter_data_t* data) {
+int read_hw_counters(hw_counter_data_t* data, const char *base_path) {
     char filepath[256];
     FILE* fp;
 
@@ -66,7 +64,7 @@ int read_hw_counters(hw_counter_data_t* data) {
     }
 
     for (int i = 0; i < NUM_HW_COUNTERS; i++) {
-        snprintf(filepath, sizeof(filepath), "%s%s", HW_COUNTER_BASE_PATH, hw_counter_files[i]);
+        snprintf(filepath, sizeof(filepath), "%s%s", base_path, hw_counter_files[i]);
         fp = fopen(filepath, "r");
         if (fp == NULL) {
             data->hw_counters_available = 0;
@@ -95,36 +93,6 @@ void print_hw_counter_diff(const char* prefix, hw_counter_data_t* start, hw_coun
     }
 }
 
-int verify(const void * src, const int64_t * dest, int64_t *src_count, ucc_aint_t *src_disp, int64_t *dst_count, ucc_aint_t *dst_disp, size_t count, int rank, int npes)
-{
-    int64_t * t_dest = (int64_t *)malloc(count * npes * sizeof(int64_t));
-    int *mpi_src_count = (int *)malloc(npes * sizeof(int));
-    int *mpi_src_disp = (int *)malloc(npes * sizeof(int));
-    int *mpi_dst_count = (int *)malloc(npes * sizeof(int));
-    int *mpi_dst_disp = (int *)malloc(npes * sizeof(int));
-   
-    MPI_Barrier(MPI_COMM_WORLD); 
-    for (int i = 0; i < npes; i++) {
-        mpi_src_count[i] = src_count[i];
-        mpi_dst_count[i] = dst_count[i];
-        mpi_src_disp[i] = src_disp[i];
-        mpi_dst_disp[i] = dst_disp[i];
-    }
-    MPI_Alltoallv(src, mpi_src_count, mpi_src_disp, MPI_LONG, t_dest, mpi_dst_count, mpi_dst_disp, MPI_LONG, MPI_COMM_WORLD);
-    MPI_Barrier(MPI_COMM_WORLD);
-    for (int i = 0; i < npes; i++) {
-        if (dest[i] != t_dest[i]) {
-            printf("[%d] error: does not validate on index i: %d (%ld != %ld)\n", rank, i, dest[i], t_dest[i]);
-            return -1;
-        }
-    }
-    free(t_dest);
-    free(mpi_src_count);
-    free(mpi_src_disp);
-    free(mpi_dst_count);
-    free(mpi_dst_disp);
-    return 0;
-}
 
 static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
                                    void *coll_info, void **req)
@@ -164,21 +132,18 @@ int main(int argc, char ** argv)
 {
     int me;
     int npes;
-    int count = 1048576;  // Reduced from 1048576 to avoid memory registration issues
+    int count = 1048576;
     long * pSync;
-    long * pSync2;
-    long * pSync3;
-    double * pWrk;
-    static long val = 9999;
-    static double min_latency, max_latency;
-    static double total_time = 0.0;
-    static double start, end, total = 0.0;
-    static double src_buff, dest_buff;
+    double min_latency, max_latency;
+    double total_time = 0.0;
+    double start, end, total = 0.0;
+    double src_buff;
     int size = 1;
     int num = 1;
     size_t iter = NR_ITER;
     int ppn = 1;
-    int monitor_hw_counters = 0;  // Flag for hardware counter monitoring
+    const char *hw_iface = NULL;
+    char hw_counter_base_path[256];
     hw_counter_data_t hw_counters_available_check = {0};
     char c;
     ucc_context_params_t ctx_params;
@@ -189,15 +154,15 @@ int main(int argc, char ** argv)
     ucc_team_params_t team_params;
     ucc_status_t status;
     ucc_lib_h ucc_lib;
-    static uint64_t local_count = 0;
-    static uint64_t global_count = 0;
+    uint64_t local_count = 0;
+    uint64_t global_count = 0;
 
     // Initialize MPI
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
 
-    while ((c = getopt(argc, argv, "i:s:d:p:c")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:c:")) != -1) {
         switch (c) {
             case 's':
                 size = atoi(optarg);
@@ -212,16 +177,19 @@ int main(int argc, char ** argv)
                 ppn = atoi(optarg);
                 break;
             case 'c':
-                monitor_hw_counters = 1;
+                hw_iface = optarg;
                 break;
             default:
                 return -1;
         }
     }
 
-    // Allocate memory with proper alignment for InfiniBand registration
-    int64_t* source;// = (int64_t *) malloc(npes * count * sizeof(int64_t));
-    
+    if (hw_iface) {
+        snprintf(hw_counter_base_path, sizeof(hw_counter_base_path),
+                 "/sys/class/infiniband/%s/ports/1/hw_counters/", hw_iface);
+    }
+
+    int64_t* source;
     if (posix_memalign((void**)&source, 4096, npes * count * sizeof(int64_t)) != 0) {
         printf("Failed to allocate aligned memory for source\n");
         return -1;
@@ -274,6 +242,7 @@ int main(int argc, char ** argv)
         printf("init error\n");
         return -1;
     }
+    ucc_lib_config_release(lib_config);
 
     if (UCC_OK != ucc_context_config_read(ucc_lib, NULL, &ctx_config)) {
         printf("error on ctx\n");
@@ -309,60 +278,44 @@ int main(int argc, char ** argv)
     }
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Initialize hardware counter monitoring if enabled
-    if (monitor_hw_counters) {
-        hw_counters_available_check.hw_counters_available = check_hw_counters_available();
+    if (hw_iface) {
+        hw_counters_available_check.hw_counters_available = check_hw_counters_available(hw_counter_base_path);
         if (me == 0) {
             if (hw_counters_available_check.hw_counters_available) {
-                printf("Hardware counter monitoring enabled - congestion control counters available\n");
+                printf("Hardware counter monitoring enabled for %s\n", hw_iface);
             } else {
-                printf("Hardware counter monitoring enabled - WARNING: congestion control counters not available, monitoring disabled\n");
-                monitor_hw_counters = 0; // Disable monitoring
+                printf("Hardware counter monitoring requested for %s but counters not available, disabling\n", hw_iface);
+                hw_iface = NULL;
             }
         }
     }
 
     if (me == 0) {
-        if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
-            printf("%-10s%-10s%15s%13s%13s%13s%13s%13s%15s%15s%15s%20s\n", "Size",
-                                                  "PE size",
-                                                  "Bandwidth MB/s",
-                                                  "Agg MB/s",
-                                                  "Max BW",
-                                                  "Avg Latency",
-                                                  "Min Latency",
-                                                  "Max Latency",
-                                                  "CNP Sent",
-                                                  "CNP Handled",
-                                                  "CNP Ignored",
-                                                  "ECN Marked");
+        if (hw_iface && hw_counters_available_check.hw_counters_available) {
+            printf("%-10s%-12s%15s%15s%15s%14s%14s%14s%14s%15s%15s%15s%20s\n",
+                   "Size (B)", "Total (B)",
+                   "BW (MB/s)", "Agg BW (MB/s)", "Max BW (MB/s)",
+                   "Avg Lat (us)", "Min Lat (us)", "Max Lat (us)", "Var (us^2)",
+                   "CNP Sent", "CNP Handled", "CNP Ignored", "ECN Marked");
         } else {
-            printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size",
-                                                  "PE size",
-                                                  "Bandwidth MB/s",
-                                                  "Agg MB/s",
-                                                  "Max BW",
-                                                  "Avg Latency",
-                                                  "Min Latency",
-                                                  "Max Latency");
+            printf("%-10s%-12s%15s%15s%15s%14s%14s%14s%14s\n",
+                   "Size (B)", "Total (B)",
+                   "BW (MB/s)", "Agg BW (MB/s)", "Max BW (MB/s)",
+                   "Avg Lat (us)", "Min Lat (us)", "Max Lat (us)", "Var (us^2)");
         }
     }
 
     for (int k = 1; k <= count; k *= 2) {
         double bandwidth = 0, agg_bandwidth = 0;
-        double max_agg = 0;
-        static double total_bw = 0, min = 0;
+        double total_bw = 0, min = 0, sum_sq = 0.0;
         min = (double) INT_MAX;
         max_latency = (double) INT_MIN;
         total = 0;
 
-        // Hardware counter data for this message size
-        hw_counter_data_t size_start_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
-        hw_counter_data_t size_end_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
         hw_counter_data_t total_size_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
 
         // Initialize total counters to zero
-        if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+        if (hw_iface && hw_counters_available_check.hw_counters_available) {
             for (int i = 0; i < NUM_HW_COUNTERS; i++) {
                 total_size_counters.counters[i] = 0;
             }
@@ -370,7 +323,6 @@ int main(int argc, char ** argv)
         /* alltoall */
         for (int i = 0; i < iter + SKIP; i++) {
             long * a_psync = pSync;
-            double b_start, b_end;
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
                 .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
@@ -392,22 +344,22 @@ int main(int argc, char ** argv)
                 .global_work_buffer = a_psync,
             };
 
-            ucc_coll_req_h req = NULL;
-            status = ucc_collective_init(&coll_args, &req, ucc_team);
-            if (status != UCC_OK) {
-                printf("coll init failed\n");
-                return -1;
-            }
             // Start hardware counter measurement for this iteration
             hw_counter_data_t iter_start_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
-            if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
-                read_hw_counters(&iter_start_counters);
+            if (hw_iface && hw_counters_available_check.hw_counters_available) {
+                read_hw_counters(&iter_start_counters, hw_counter_base_path);
             }
 
             MPI_Barrier(MPI_COMM_WORLD);
             start = MPI_Wtime();
 
             for (int z = 0; z < num; z++) {
+                ucc_coll_req_h req = NULL;
+                status = ucc_collective_init(&coll_args, &req, ucc_team);
+                if (status != UCC_OK) {
+                    printf("coll init failed\n");
+                    return -1;
+                }
                 status = ucc_collective_post(req);
                 if (status != UCC_OK) {
                     printf("FAILED TO POST\n");
@@ -426,8 +378,8 @@ int main(int argc, char ** argv)
 
             // Stop hardware counter measurement for this iteration
             hw_counter_data_t iter_end_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
-            if (monitor_hw_counters && hw_counters_available_check.hw_counters_available && i >= SKIP) {
-                read_hw_counters(&iter_end_counters);
+            if (hw_iface && hw_counters_available_check.hw_counters_available && i >= SKIP) {
+                read_hw_counters(&iter_end_counters, hw_counter_base_path);
                 // Accumulate counter differences for valid iterations
                 for (int j = 0; j < NUM_HW_COUNTERS; j++) {
                     total_size_counters.counters[j] += (iter_end_counters.counters[j] - iter_start_counters.counters[j]);
@@ -436,12 +388,13 @@ int main(int argc, char ** argv)
 
             MPI_Barrier(MPI_COMM_WORLD);
 
-            if (i > SKIP) {
+            if (i >= SKIP) {
                 double time = (end - start);
                 total += time;
+                sum_sq += time * time;
                 if (time < min) {
                     min = time;
-                } 
+                }
                 if (time > max_latency) {
                     max_latency = time;
                 }
@@ -451,7 +404,7 @@ int main(int argc, char ** argv)
 
         // Aggregate hardware counter results across all processes using MPI
         hw_counter_data_t global_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
-        if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
+        if (hw_iface && hw_counters_available_check.hw_counters_available) {
             // Initialize global counters to zero
             for (int j = 0; j < NUM_HW_COUNTERS; j++) {
                 global_counters.counters[j] = 0;
@@ -464,40 +417,44 @@ int main(int argc, char ** argv)
             }
         }
 
-        // Use MPI collective operations for statistics
-        double global_min, global_max, global_total;
+        double global_min, global_max, global_total, global_sum_sq;
         MPI_Allreduce(&min, &global_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
         MPI_Allreduce(&max_latency, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         MPI_Allreduce(&total, &global_total, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        
+        MPI_Allreduce(&sum_sq, &global_sum_sq, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
         min_latency = global_min;
-        total_time = total;  // Use local total for bandwidth (like OpenSHMEM)
+        total_time = total;
         max_latency = global_max;
-        double avg_time = global_total / npes;  // Global average time for latency calculation
-        
+        double n = (double)npes * (iter - SKIP);
+        double avg_time = global_total / npes;
+        double mean = global_total / n;
+        double variance_us2 = (global_sum_sq / n - mean * mean) * 1e12;
+
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
         bandwidth = (npes * (k * sizeof(uint64_t)) * (iter - SKIP)) / (total_time);
         src_buff = bandwidth;
-        
-        // Aggregate bandwidth across all processes
+
         MPI_Allreduce(&src_buff, &agg_bandwidth, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         MPI_Barrier(MPI_COMM_WORLD);
         if (me == 0) {
-            printf("%-10ld", k * sizeof(uint64_t));
-            printf("%-10ld", k * sizeof(uint64_t) * npes);
-            printf("%15.2f", (bandwidth / (1024 * 1024)) * ppn);
-            printf("%13.2f", agg_bandwidth / (1024 * 1024));
-            printf("%13.2f", total_bw);
-            printf("%13.2f", (avg_time * 1e6) / ((iter - SKIP)));
-            printf("%13.2f", min_latency * 1e6);
-            printf("%13.2f", max_latency * 1e6);
+            printf("%-10ld%-12ld%15.2f%15.2f%15.2f%14.2f%14.2f%14.2f%14.2f",
+                   k * sizeof(uint64_t),
+                   k * sizeof(uint64_t) * npes,
+                   (bandwidth / (1024 * 1024)) * ppn,
+                   agg_bandwidth / (1024 * 1024),
+                   total_bw * ppn,
+                   (avg_time * 1e6) / (iter - SKIP),
+                   min_latency * 1e6,
+                   max_latency * 1e6,
+                   variance_us2);
 
-            // Print hardware counter results as additional columns if monitoring is enabled
-            if (monitor_hw_counters && hw_counters_available_check.hw_counters_available) {
-                printf("%15lu", global_counters.counters[0]); // CNP Sent
-                printf("%15lu", global_counters.counters[1]); // CNP Handled
-                printf("%15lu", global_counters.counters[2]); // CNP Ignored
-                printf("%20lu", global_counters.counters[3]); // ECN Marked
+            if (hw_iface && hw_counters_available_check.hw_counters_available) {
+                printf("%15lu%15lu%15lu%20lu",
+                       global_counters.counters[0],
+                       global_counters.counters[1],
+                       global_counters.counters[2],
+                       global_counters.counters[3]);
             }
             printf("\n");
         }
@@ -505,12 +462,8 @@ int main(int argc, char ** argv)
 
     MPI_Barrier(MPI_COMM_WORLD);
     
-    // Cleanup
     free(source);
     free(pSync);
-    free(pSync2);
-    free(pSync3);
-    free(pWrk);
     free(maps);
     
     MPI_Finalize();
