@@ -307,7 +307,9 @@ int main(int argc, char ** argv)
 
     for (int k = 1; k <= count; k *= 2) {
         double bandwidth = 0, agg_bandwidth = 0;
-        double total_bw = 0, min = 0, sum_sq = 0.0;
+        double total_bw = 0, min = 0;
+        double welford_mean = 0.0, welford_M2 = 0.0;
+        int welford_count = 0;
         min = (double) INT_MAX;
         max_latency = (double) INT_MIN;
         total = 0;
@@ -391,7 +393,10 @@ int main(int argc, char ** argv)
             if (i >= SKIP) {
                 double time = (end - start);
                 total += time;
-                sum_sq += time * time;
+                welford_count++;
+                double w_delta = time - welford_mean;
+                welford_mean += w_delta / welford_count;
+                welford_M2 += w_delta * (time - welford_mean);
                 if (time < min) {
                     min = time;
                 }
@@ -417,19 +422,24 @@ int main(int argc, char ** argv)
             }
         }
 
-        double global_min, global_max, global_total, global_sum_sq;
+        double global_min, global_max, global_total;
         MPI_Allreduce(&min, &global_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
         MPI_Allreduce(&max_latency, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         MPI_Allreduce(&total, &global_total, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&sum_sq, &global_sum_sq, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         min_latency = global_min;
         total_time = total;
         max_latency = global_max;
         double n = (double)npes * (iter - SKIP);
         double avg_time = global_total / npes;
-        double mean = global_total / n;
-        double variance_us2 = (global_sum_sq / n - mean * mean) * 1e12;
+        double global_mean = global_total / n;
+        /* Combine per-rank Welford M2 with correction for difference between
+         * local and global mean, then allreduce for numerically stable variance. */
+        double local_dev_sq = welford_M2 + (welford_mean - global_mean) *
+                              (welford_mean - global_mean) * welford_count;
+        double global_dev_sq;
+        MPI_Allreduce(&local_dev_sq, &global_dev_sq, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        double variance_us2 = (global_dev_sq / n) * 1e12;
 
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
         bandwidth = (npes * (k * sizeof(uint64_t)) * (iter - SKIP)) / (total_time);
