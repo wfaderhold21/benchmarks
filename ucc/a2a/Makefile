@@ -4,7 +4,7 @@ LDFLAGS=-lucc
 
 .PHONY: all clean
 
-all: ucc_bench_a2a ucc_bench_a2a_basic ucc_bench_a2a_verify ucc_bench_a2a_mpi
+all: ucc_bench_a2a ucc_bench_a2a_basic ucc_bench_a2a_verify ucc_bench_a2a_mpi ucc_bench_a2a_mpi_ar
 
 ucc_bench_a2a: ucc_bench_a2a.c
 
@@ -17,5 +17,8 @@ ucc_bench_a2a_verify: ucc_bench_a2a.c
 ucc_bench_a2a_mpi: ucc_bench_a2a_mpi.c
 	${CC} ${CFLAGS} ucc_bench_a2a_mpi.c -o ucc_bench_a2a_mpi ${LDFLAGS}
 
+ucc_bench_a2a_mpi_ar: ucc_bench_a2a_mpi_ar.c
+	${CC} ${CFLAGS} ucc_bench_a2a_mpi_ar.c -o ucc_bench_a2a_mpi_ar ${LDFLAGS}
+
 clean:
-	rm ucc_bench_a2a ucc_bench_a2a_basic ucc_bench_a2a_verify ucc_bench_a2a_mpi
+	rm ucc_bench_a2a ucc_bench_a2a_basic ucc_bench_a2a_verify ucc_bench_a2a_mpi ucc_bench_a2a_mpi_ar
