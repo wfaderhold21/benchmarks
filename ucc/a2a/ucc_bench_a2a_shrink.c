@@ -3,8 +3,9 @@
  *
  * Alltoall bandwidth benchmark with simulated rank failure and UCC team
  * shrink recovery. Runs alltoall across all ranks up to a configurable
- * message size, then simulates a failure by shrinking the team and
- * continues benchmarking with the reduced rank set.
+ * message size, simulates a failure, then uses the UCC resilience API
+ * (abort → recover → shrink) to rebuild the context and team on the
+ * surviving ranks and continues benchmarking with the reduced rank set.
  *
  * Usage: mpirun -np N ./ucc_bench_a2a_shrink [-i iters] [-p ppn] [-k kill] [-f fail_bytes]
  *   -i N   : iterations per message size (default 100)
@@ -23,6 +24,7 @@
 #include <malloc.h>
 
 #include <ucc/api/ucc.h>
+#include "core/ucc_context.h"   /* ucc_context_mark_rank_failed (internal) */
 
 #define NR_ITER  100
 #define SKIP     10
@@ -290,7 +292,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[rank %d] team create post error\n", me);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {}
+    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {
+        ucc_context_progress(ucc_context);
+    }
     if (UCC_OK != status) {
         fprintf(stderr, "[rank %d] team create failed: %d\n", me, status);
         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -311,7 +315,16 @@ int main(int argc, char **argv)
         return -1;
 
     /* ================================================================
-     * FAILURE + RECOVERY
+     * FAILURE + RECOVERY via UCC resilience API
+     *
+     * Flow (all ranks participate through recover; only survivors shrink):
+     *   1. Surviving ranks mark failed ranks in the UCC context
+     *   2. All ranks: ucc_context_abort  → drain collectives + BOR failure map
+     *   3. All ranks: ucc_context_recover → transition to RECOVERED state
+     *   4. All ranks: destroy old team (required before shrink)
+     *   5. MPI split — failed ranks exit after context_destroy
+     *   6. Surviving ranks: ucc_context_shrink → new context over survivors
+     *   7. Surviving ranks: create new team on new context
      * ================================================================ */
     MPI_Barrier(MPI_COMM_WORLD);
     if (me == 0) {
@@ -323,24 +336,50 @@ int main(int argc, char **argv)
 
     double t_recover_start = MPI_Wtime();
 
-    /* Destroy old team and context while all ranks are still alive */
+    /* Step 1: surviving ranks inform UCC which ranks failed */
+    if (!is_failed) {
+        for (int r = surviving_npes; r < npes; r++)
+            ucc_context_mark_rank_failed((ucc_context_t *)ucc_context,
+                                         (ucc_rank_t)r);
+    }
+
+    /* Step 2: all ranks abort — drains outstanding collectives and
+     * runs a service-level BOR allreduce to agree on the failure map */
+    double t0_abort = MPI_Wtime();
+    if (UCC_OK != ucc_context_abort(ucc_context)) {
+        fprintf(stderr, "[rank %d] context abort failed\n", me);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    do {
+        ucc_context_progress(ucc_context);
+        status = ucc_context_abort_test(ucc_context);
+    } while (status == UCC_INPROGRESS);
+    if (UCC_OK != status) {
+        fprintf(stderr, "[rank %d] context abort_test failed: %d\n", me, status);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    double t1_abort = MPI_Wtime();
+
+    /* Step 3: transition to RECOVERED — exposes failed_ranks via attr */
+    if (UCC_OK != ucc_context_recover(ucc_context)) {
+        fprintf(stderr, "[rank %d] context recover failed\n", me);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    /* Step 4: destroy old team (ucc_context_shrink requires n_teams == 0) */
     double t0_td = MPI_Wtime();
-    status = ucc_team_destroy(ucc_team);
-    double t1_td = MPI_Wtime();
+    while (UCC_INPROGRESS == (status = ucc_team_destroy(ucc_team)))
+        ucc_context_progress(ucc_context);
     if (UCC_OK != status)
         fprintf(stderr, "[rank %d] team destroy failed: %d\n", me, status);
+    double t1_td = MPI_Wtime();
 
-    double t0_cd = MPI_Wtime();
-    status = ucc_context_destroy(ucc_context);
-    double t1_cd = MPI_Wtime();
-    if (UCC_OK != status)
-        fprintf(stderr, "[rank %d] context destroy failed: %d\n", me, status);
-
-    /* Split communicator — failed ranks receive MPI_COMM_NULL */
+    /* Step 5: split MPI communicator; failed ranks clean up and exit */
     MPI_Comm new_comm;
     MPI_Comm_split(MPI_COMM_WORLD, is_failed ? MPI_UNDEFINED : 0, me, &new_comm);
 
     if (is_failed) {
+        ucc_context_destroy(ucc_context);
         ucc_finalize(ucc_lib);
         free(source);
         free(pSync);
@@ -352,8 +391,10 @@ int main(int argc, char **argv)
     MPI_Comm_rank(new_comm, &new_me);
     MPI_Comm_size(new_comm, &new_npes);
 
-    /* Create new UCC context over the shrunken communicator */
-    double t0_cc = MPI_Wtime();
+    /* Step 6: shrink context to surviving ranks.
+     * ucc_context_shrink creates a new context using the provided params
+     * (OOB backed by new_comm) and destroys the old context automatically. */
+    double t0_shrink = MPI_Wtime();
     ucc_context_params_t new_ctx_params = {
         .mask       = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS,
         .oob        = {
@@ -367,20 +408,20 @@ int main(int argc, char **argv)
         .mem_params = { .n_segments = 2, .segments = maps },
     };
     ucc_context_config_h new_ctx_config;
-    ucc_context_h new_context;
+    ucc_context_h new_ctx;
     if (UCC_OK != ucc_context_config_read(ucc_lib, NULL, &new_ctx_config)) {
         fprintf(stderr, "[rank %d] new ctx config error\n", new_me);
         MPI_Abort(new_comm, 1);
     }
-    if (UCC_OK != ucc_context_create(ucc_lib, &new_ctx_params, new_ctx_config,
-                                     &new_context)) {
-        fprintf(stderr, "[rank %d] new ctx create error\n", new_me);
+    if (UCC_OK != ucc_context_shrink(ucc_context, &new_ctx_params,
+                                      new_ctx_config, &new_ctx)) {
+        fprintf(stderr, "[rank %d] context shrink failed\n", new_me);
         MPI_Abort(new_comm, 1);
     }
     ucc_context_config_release(new_ctx_config);
-    double t1_cc = MPI_Wtime();
+    double t1_shrink = MPI_Wtime();
 
-    /* Create new UCC team over the shrunken communicator */
+    /* Step 7: create new UCC team on the shrunken context */
     double t0_tc = MPI_Wtime();
     ucc_team_params_t new_team_params = {
         .mask  = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB |
@@ -397,11 +438,12 @@ int main(int argc, char **argv)
         .flags = UCC_TEAM_FLAG_COLL_WORK_BUFFER,
     };
     ucc_team_h new_team;
-    if (UCC_OK != ucc_team_create_post(&new_context, 1, &new_team_params, &new_team)) {
+    if (UCC_OK != ucc_team_create_post(&new_ctx, 1, &new_team_params, &new_team)) {
         fprintf(stderr, "[rank %d] new team create post error\n", new_me);
         MPI_Abort(new_comm, 1);
     }
-    while (UCC_INPROGRESS == (status = ucc_team_create_test(new_team))) {}
+    while (UCC_INPROGRESS == (status = ucc_team_create_test(new_team)))
+        ucc_context_progress(new_ctx);
     if (UCC_OK != status) {
         fprintf(stderr, "[rank %d] new team create failed: %d\n", new_me, status);
         MPI_Abort(new_comm, 1);
@@ -413,9 +455,9 @@ int main(int argc, char **argv)
     /* Report recovery timing (max across surviving ranks) */
     double times[5] = {
         t_recover_end - t_recover_start,
+        t1_abort - t0_abort,
         t1_td - t0_td,
-        t1_cd - t0_cd,
-        t1_cc - t0_cc,
+        t1_shrink - t0_shrink,
         t1_tc - t0_tc,
     };
     double max_times[5];
@@ -425,11 +467,11 @@ int main(int argc, char **argv)
     if (new_me == 0) {
         printf("[RECOVERY COMPLETE] %d ranks -> %d ranks (killed %d)\n",
                npes, new_npes, kill_count);
-        printf("  Total recovery:  %8.2f ms\n",   max_times[0] * 1e3);
-        printf("  Team destroy:    %8.2f ms\n",   max_times[1] * 1e3);
-        printf("  Context destroy: %8.2f ms\n",   max_times[2] * 1e3);
-        printf("  Context create:  %8.2f ms\n",   max_times[3] * 1e3);
-        printf("  Team create:     %8.2f ms\n\n", max_times[4] * 1e3);
+        printf("  Total recovery:   %8.2f ms\n",   max_times[0] * 1e3);
+        printf("  Abort + resolve:  %8.2f ms\n",   max_times[1] * 1e3);
+        printf("  Team destroy:     %8.2f ms\n",   max_times[2] * 1e3);
+        printf("  Context shrink:   %8.2f ms\n",   max_times[3] * 1e3);
+        printf("  Team create:      %8.2f ms\n\n", max_times[4] * 1e3);
     }
 
     /* ================================================================
@@ -447,15 +489,16 @@ int main(int argc, char **argv)
 
     if (start_k <= count) {
         if (run_a2a_phase(new_me, new_npes, start_k, count, iter, ppn,
-                          source, dest, pSync, new_team, new_context,
+                          source, dest, pSync, new_team, new_ctx,
                           new_comm) != 0)
             return -1;
     }
 
     /* Cleanup */
     MPI_Barrier(new_comm);
-    ucc_team_destroy(new_team);
-    ucc_context_destroy(new_context);
+    while (UCC_INPROGRESS == (status = ucc_team_destroy(new_team)))
+        ucc_context_progress(new_ctx);
+    ucc_context_destroy(new_ctx);
     ucc_finalize(ucc_lib);
     free(source);
     free(pSync);

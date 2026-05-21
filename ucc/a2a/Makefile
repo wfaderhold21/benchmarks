@@ -20,8 +20,10 @@ ucc_bench_a2a_mpi: ucc_bench_a2a_mpi.c
 ucc_bench_a2a_mpi_ar: ucc_bench_a2a_mpi_ar.c
 	${CC} ${CFLAGS} ucc_bench_a2a_mpi_ar.c -o ucc_bench_a2a_mpi_ar ${LDFLAGS}
 
+UCC_SRC ?= $(HOME)/ucc-resilience
+
 ucc_bench_a2a_shrink: ucc_bench_a2a_shrink.c
-	${CC} ${CFLAGS} ucc_bench_a2a_shrink.c -o ucc_bench_a2a_shrink ${LDFLAGS}
+	${CC} ${CFLAGS} -I$(UCC_SRC)/src ucc_bench_a2a_shrink.c -o ucc_bench_a2a_shrink ${LDFLAGS}
 
 clean:
 	rm ucc_bench_a2a ucc_bench_a2a_basic ucc_bench_a2a_verify ucc_bench_a2a_mpi ucc_bench_a2a_mpi_ar ucc_bench_a2a_shrink
