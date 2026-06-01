@@ -41,6 +41,8 @@ double gt1, gt2, gt3, gt4;
 static long pSync[SHMEM_ALLTOALL_SYNC_SIZE];
 static long max_pSync[SHMEM_REDUCE_SYNC_SIZE];
 static size_t max_pWrk[SHMEM_REDUCE_MIN_WRKDATA_SIZE];
+static long dot_pSync[SHMEM_REDUCE_SYNC_SIZE];
+static double dot_pWrk[SHMEM_REDUCE_MIN_WRKDATA_SIZE];
 
 struct array_3d
 {
@@ -700,17 +702,17 @@ void matrix_vector_mult(struct array_3d *v_in, struct array_3d *v_out,
   }
   start_send_boundaries(v_in, comm_data);
 
-  /* multiply boundaries */
-  if (comm_data->rank == 0) {
-    DEBUG_PRINT("Multiplying boundaries in matrix_vector_mult...\n");
-  }
-  mult_boundaries(v_in, &comm_data->recv_buffers);
-
   /* wait for all communication to complete */
   if (comm_data->rank == 0) {
     DEBUG_PRINT("Waiting for communication to complete...\n");
   }
   finish_send_boundaries(comm_data);
+
+  /* multiply boundaries */
+  if (comm_data->rank == 0) {
+    DEBUG_PRINT("Multiplying boundaries in matrix_vector_mult...\n");
+  }
+  mult_boundaries(v_in, &comm_data->recv_buffers);
 
   t2 = MPI_Wtime();
   gt3 += t2 - t1;
@@ -775,14 +777,15 @@ void vector_assign_add(struct array_3d *v, struct array_3d *w)
 double parallel_dot(struct array_3d *v, struct array_3d *w, struct comm_data_t *comm_data)
 {
   int i;
-  static double local_dot = 0.0;
+  static double local_dot;
   static double global_dot;
 
+  local_dot = 0.0;
   for (i= 0; i < vector_size(v); i++) {
     local_dot+= v->array[i] * w->array[i];
   }
 
-  shmem_double_sum_to_all(&global_dot, &local_dot, 1, 0, 0, comm_data->npes, NULL, 0);
+  shmem_double_sum_to_all(&global_dot, &local_dot, 1, 0, 0, comm_data->npes, dot_pWrk, dot_pSync);
 
   return global_dot;
 }
@@ -904,6 +907,7 @@ int main(int argc, char** argv)
   }
   for (i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
     max_pSync[i] = SHMEM_SYNC_VALUE;
+    dot_pSync[i] = SHMEM_SYNC_VALUE;
   }
 
   /* First run with blocking version */

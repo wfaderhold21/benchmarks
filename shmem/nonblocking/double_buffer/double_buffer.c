@@ -59,8 +59,8 @@ int main(int argc, char **argv) {
     double compute_time;
     double latency, latency_avg;
     int i;
-    long pSync_a2a_odd[_SHMEM_ALLTOALL_SYNC_SIZE];
-    long pSync_a2a_even[_SHMEM_ALLTOALL_SYNC_SIZE];
+    static long pSync_a2a_odd[SHMEM_ALLTOALL_SYNC_SIZE];
+    static long pSync_a2a_even[SHMEM_ALLTOALL_SYNC_SIZE];
 
     // Initialize OpenSHMEM
     shmem_init();
@@ -188,8 +188,10 @@ int main(int argc, char **argv) {
     total_comm_time += comm_time2 - comm_time1;
 #else
     comm_time1 = MPI_Wtime();
-    shmem_req_wait(&odd_req);
-    shmem_req_wait(&even_req);
+    if (odd_req != SHMEM_REQ_INVALID)
+        shmem_req_wait(&odd_req);
+    if (even_req != SHMEM_REQ_INVALID)
+        shmem_req_wait(&even_req);
     #ifndef WITHOUT_SYNC
         shmem_sync_all();
     #endif
