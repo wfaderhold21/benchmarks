@@ -39,7 +39,9 @@ void sharp_finalize(void) {
 }
 
 int cmpfunc(const void * a, const void * b) {
-    return ((*(double *)a) - (*(double *)b));
+    double aa = *(const double *)a;
+    double bb = *(const double *)b;
+    return (aa > bb) - (aa < bb);
 }
 
 static inline int get_times(int nr_iterations, int dest_pe, double * agg, double * times, sharp_group_allocated_t * comm_group) {

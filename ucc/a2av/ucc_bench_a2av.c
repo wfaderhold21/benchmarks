@@ -36,11 +36,20 @@ int verify(const void * src, const int64_t * dest, int64_t *src_count, ucc_aint_
     MPI_Alltoallv(src, mpi_src_count, mpi_src_disp, MPI_LONG, t_dest, mpi_dst_count, mpi_dst_disp, MPI_LONG, MPI_COMM_WORLD);
     shmem_barrier_all();
     for (int i = 0; i < npes; i++) {
-        if (dest[i] != t_dest[i]) {
-            printf("[%d] error: does not validate on index i: %d (%ld != %ld)\n", rank, i, dest[i], t_dest[i]);
-            return -1;
+        for (int64_t j = 0; j < dst_count[i]; j++) {
+            ucc_aint_t idx = dst_disp[i] + j;
+            if (dest[idx] != t_dest[idx]) {
+                printf("[%d] error: does not validate on index %ld (%ld != %ld)\n",
+                       rank, (long)idx, dest[idx], t_dest[idx]);
+                return -1;
+            }
         }
     }
+    shmem_free(t_dest);
+    free(mpi_src_count);
+    free(mpi_src_disp);
+    free(mpi_dst_count);
+    free(mpi_dst_disp);
     return 0;
 }
 
@@ -78,6 +87,18 @@ static ucc_status_t oob_allgather_free(void *req)
     return UCC_OK;
 }
 
+static size_t get_ucc_work_buffer_size(ucc_context_h ctx)
+{
+    ucc_context_attr_t attr;
+
+    attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ctx, &attr) ||
+        attr.global_work_buffer_size == 0) {
+        return 5 * sizeof(long);
+    }
+    return attr.global_work_buffer_size;
+}
+
 int main(int argc, char ** argv)
 {
     int me;// = shmem_me();
@@ -90,7 +111,7 @@ int main(int argc, char ** argv)
     long * pSync3;
     double * pWrk;
     static long val = 9999;
-    static double min_latency, max_latency;
+    static double min_latency, max_latency, global_max_latency;
     static double total_time = 0.0;
     static double start, end, total = 0.0;
     static double src_buff, dest_buff;
@@ -123,22 +144,16 @@ int main(int argc, char ** argv)
     src_disp = malloc(sizeof(int64_t) * npes);
     dst_disp = malloc(sizeof(int64_t) * npes);
 
-//    int64_t* dest = (int64_t*) shmem_malloc(npes * count * npes * sizeof(int64_t));
-//    int64_t* source = (int64_t*) shmem_malloc(npes * count * sizeof(int64_t));
     int64_t* source = (int64_t *) shmem_malloc(npes * (count * sizeof(int64_t)));
-    int64_t* dest = source;// + (npes * count * sizeof(int64_t)); /* to save memory */
+    int64_t* dest = (int64_t *) shmem_malloc(npes * (count * sizeof(int64_t)));
 
     int64_t disp = 0;
     int64_t in_disp = 0;
 
-    pSync = (long *) shmem_malloc(sizeof(long) * (5));
-    pSync2 = (long *) shmem_malloc(sizeof(long) * (5));//SHMEM_ALLTOALL_SYNC_SIZE);
     pSync3 = (long *) shmem_malloc(sizeof(long) * SHMEM_REDUCE_SYNC_SIZE);
     pWrk = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
 
-    for (int i = 0; i < 5; i++) {
-        pSync[i] = 0; //SHMEM_SYNC_VALUE;
-        pSync2[i] = 0;// SHMEM_SYNC_VALUE;
+    for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
         pSync3[i] = SHMEM_SYNC_VALUE;
     }
 
@@ -148,18 +163,10 @@ int main(int argc, char ** argv)
         return -1;
     }
 
-//    maps[0].address = dest;
-//    maps[0].len = npes * count * npes * sizeof(int64_t);
     maps[0].address = source;
-    maps[0].len = 2 * npes * count * sizeof(int64_t);
-    maps[1].address = pSync;
-    maps[1].len = 5 * sizeof(long);
-    maps[2].address = pSync2;
-    maps[2].len = 5 * sizeof(long);
-    maps[3].address = pSync3;
-    maps[3].len = SHMEM_REDUCE_SYNC_SIZE * sizeof(long);
-    maps[4].address = pWrk;
-    maps[4].len = SHMEM_REDUCE_MIN_WRKDATA_SIZE * sizeof(double);
+    maps[0].len = npes * count * sizeof(int64_t);
+    maps[1].address = dest;
+    maps[1].len = npes * count * sizeof(int64_t);
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
@@ -169,7 +176,7 @@ int main(int argc, char ** argv)
     ctx_params.oob.n_oob_eps = npes;
     ctx_params.oob.oob_ep = me;
     ctx_params.mem_params.segments = maps;
-    ctx_params.mem_params.n_segments = 5;
+    ctx_params.mem_params.n_segments = 2;
 
     ucc_lib_params_t lib_params = {
         .mask = UCC_LIB_PARAM_FIELD_THREAD_MODE,
@@ -199,6 +206,15 @@ int main(int argc, char ** argv)
 
     ucc_context_config_release(ctx_config);
 
+    size_t work_buffer_size = get_ucc_work_buffer_size(ucc_context);
+    pSync = (long *)shmem_calloc(1, work_buffer_size);
+    pSync2 = (long *)shmem_calloc(1, work_buffer_size);
+    if (NULL == pSync || NULL == pSync2) {
+        printf("OOM: UCC work buffers\n");
+        return -1;
+    }
+    shmem_barrier_all();
+
     team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS;
     team_params.oob.allgather = oob_allgather;
     team_params.oob.req_test = oob_allgather_test;
@@ -214,7 +230,9 @@ int main(int argc, char ** argv)
         return -1; 
     }   
 
-    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {}
+    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {
+        ucc_context_progress(ucc_context);
+    }
     if (UCC_OK != status) {
         printf("team create failed\n");
         return -1; 
@@ -255,11 +273,11 @@ int main(int argc, char ** argv)
         /* alltoall */
         for (int i = 0; i < NR_ITER + SKIP; i++) {
             long * a_psync = (i % 2) ? pSync : pSync2;
-            double b_start, b_end;
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
                 .flags     = UCC_COLL_ARGS_FLAG_COUNT_64BIT | UCC_COLL_ARGS_FLAG_DISPLACEMENTS_64BIT 
-                           | UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
+                           | UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS
+                           | UCC_COLL_ARGS_FLAG_PERSISTENT,
                 .coll_type = UCC_COLL_TYPE_ALLTOALLV,
                 .src.info_v =
                     {
@@ -300,13 +318,13 @@ int main(int argc, char ** argv)
                     }
                     ucc_context_progress(ucc_context);
                 }
-                ucc_collective_finalize(req);
             }
+            ucc_collective_finalize(req);
 #ifdef WITH_BASIC
                 shmem_barrier_all();
 #endif
-            end = MPI_Wtime();
             shmem_barrier_all();
+            end = MPI_Wtime();
 
             #ifdef WITH_VERIFY
             int ret = verify(source, dest, src_count, src_disp, dst_count, dst_disp, k, me, npes);
@@ -314,7 +332,7 @@ int main(int argc, char ** argv)
                 return ret;
             }
             #endif
-            if (i > SKIP) {
+            if (i >= SKIP) {
                 double time = (end - start);
                 total += time;// - (b_end - b_start);
                 if (time < min) {
@@ -329,10 +347,13 @@ int main(int argc, char ** argv)
 
         shmem_double_min_to_all(&min_latency, &min, 1, 0, 0, npes, pWrk, pSync3);
         shmem_barrier_all();
+        shmem_double_max_to_all(&global_max_latency, &max_latency, 1, 0, 0, npes, pWrk, pSync3);
+        max_latency = global_max_latency;
+        shmem_barrier_all();
         shmem_double_sum_to_all(&total_time, &total, 1, 0, 0, npes, pWrk, pSync3);
-        total_time = total;
+        double avg_time = total_time / npes;
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
-        bandwidth = (npes * (k * sizeof(uint64_t)) * (NR_ITER - SKIP)) / (total_time);
+        bandwidth = (npes * (k * sizeof(uint64_t)) * (double)NR_ITER) / avg_time;
         src_buff = bandwidth;
         shmem_barrier_all();
         shmem_double_sum_to_all(&dest_buff, &src_buff, 1, 0, 0, npes, pWrk, pSync3); 
@@ -345,7 +366,7 @@ int main(int argc, char ** argv)
             printf("%15.2f", bandwidth / (1024 * 1024));
             printf("%13.2f", agg_bandwidth / (1024 * 1024));
             printf("%13.2f", total_bw);
-            printf("%13.2f", (total_time * 1e6) / ((NR_ITER - SKIP)));
+            printf("%13.2f", (avg_time * 1e6) / (double)NR_ITER);
             printf("%13.2f", min_latency * 1e6);
             printf("%13.2f\n", max_latency * 1e6);
         }

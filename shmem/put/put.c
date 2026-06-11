@@ -32,27 +32,32 @@ int main(void)
     char * data;
     char * rbuf;
     int i = 0;
+    const size_t buffer_size = (1 << 23) * 100;
 
     shmem_init();
     my_pe = shmem_my_pe();
     n_pes = shmem_n_pes();
 
 #if WITH_HINTS
-        data = (char *) shmemx_malloc_with_hint((1<<23)*100, SHMEM_HINT_NEAR_NIC_MEM);
-        rbuf = (char *) shmemx_malloc_with_hint((1<<23)*100, SHMEM_HINT_NEAR_NIC_MEM);
+        data = (char *) shmemx_malloc_with_hint(buffer_size, SHMEM_HINT_NEAR_NIC_MEM);
+        rbuf = (char *) shmemx_malloc_with_hint(buffer_size, SHMEM_HINT_NEAR_NIC_MEM);
 #else
-        data = (char *) shmem_malloc((1<<23)*100);
-        rbuf = (char *) shmem_malloc((1<<23)*100);
+        data = (char *) shmem_malloc(buffer_size);
+        rbuf = (char *) shmem_malloc(buffer_size);
 #endif
 
 
     for (i = 0; i <= 23; i++) {
         nr_elems = (1 << i);
         double f_start = 0, f_end = 0, m_time = 0;
-        double latency = 0, bandwidth = 0;
+        double latency_us = 0, message_rate = 0, bandwidth = 0;
         double size = 0;
         int j = 0, k = 0;
         int iterations = (1<<23) / nr_elems + 100;
+        size_t max_iterations = buffer_size / (size_t)nr_elems;
+        if ((size_t)iterations > max_iterations) {
+            iterations = (int)max_iterations;
+        }
 
         for (j = 0; j < nr_elems; j++) {
             data[j] = 'a';
@@ -60,7 +65,7 @@ int main(void)
         }               
 
         shmem_barrier_all();
-        for (k = 0; k < WARMUP; i++) {
+        for (k = 0; k < WARMUP; k++) {
             shmem_putmem(&rbuf[k], &data[k], 1, 0);
         }
         shmem_barrier_all();
@@ -75,7 +80,8 @@ int main(void)
         }
         shmem_barrier_all();
 
-        latency = (iterations * 1e6) / (f_end - f_start); // in us
+        latency_us = (f_end - f_start) / iterations;
+        message_rate = (iterations * 1e6) / (f_end - f_start);
         size = (1.0 * iterations * nr_elems); // MB
         bandwidth = size / ((f_end - f_start) / 1e6);
 
@@ -87,7 +93,8 @@ int main(void)
             } else {
                 printf("** Time with size %lu MB:\n", nr_elems / (1024 * 1024));
             }
-            printf("\tMessage rate: %g m/s\n", latency);
+            printf("\tAvg Latency: %g us\n", latency_us);
+            printf("\tMessage rate: %g m/s\n", message_rate);
             printf("\tBandwidth: %g MB/s\n", bandwidth / (1024 * 1024));
         }
     }
@@ -96,4 +103,3 @@ int main(void)
     shmem_finalize();
     return 0;
 }
-

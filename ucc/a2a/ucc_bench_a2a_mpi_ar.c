@@ -96,6 +96,29 @@ static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
 static ucc_status_t oob_allgather_test(void *req)  { return UCC_OK; }
 static ucc_status_t oob_allgather_free(void *req)  { return UCC_OK; }
 
+static size_t get_ucc_work_buffer_size(ucc_context_h ctx)
+{
+    ucc_context_attr_t attr;
+
+    attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ctx, &attr) ||
+        attr.global_work_buffer_size == 0) {
+        return 5 * sizeof(long);
+    }
+    return attr.global_work_buffer_size;
+}
+
+static void *alloc_zeroed_aligned(size_t size)
+{
+    void *ptr = NULL;
+
+    if (posix_memalign(&ptr, 4096, size) != 0) {
+        return NULL;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
 /* Create a UCC lib + context + team scoped to `comm`.
  * If `mem_segments` is non-NULL, register them with the context (used by the
  * one-sided alltoall path). */
@@ -150,7 +173,9 @@ static int create_ucc_stack(MPI_Comm comm,
 
     if (UCC_OK != ucc_team_create_post(out_ctx, 1, &team_params, out_team)) return -1;
     ucc_status_t s;
-    while (UCC_INPROGRESS == (s = ucc_team_create_test(*out_team))) {}
+    while (UCC_INPROGRESS == (s = ucc_team_create_test(*out_team))) {
+        ucc_context_progress(*out_ctx);
+    }
     if (UCC_OK != s) return -1;
     return 0;
 }
@@ -275,7 +300,13 @@ int main(int argc, char ** argv)
 
         run_background_allreduce(ctx, team, sbuf, rbuf, done_req);
 
-        ucc_team_destroy(team);
+        ucc_status_t destroy_status;
+        while (UCC_INPROGRESS == (destroy_status = ucc_team_destroy(team))) {
+            ucc_context_progress(ctx);
+        }
+        if (UCC_OK != destroy_status) {
+            fprintf(stderr, "bg team destroy failed: %d\n", destroy_status);
+        }
         ucc_context_destroy(ctx);
         ucc_finalize(lib);
         free(sbuf); free(rbuf);
@@ -294,22 +325,22 @@ int main(int argc, char ** argv)
     }
     int64_t *dest = source;
 
-    if (posix_memalign((void **)&pSync, 4096, sizeof(long) * 5) != 0) {
-        fprintf(stderr, "Failed to allocate pSync\n"); MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    for (int i = 0; i < 5; i++) pSync[i] = 0;
-
-    ucc_mem_map_t maps[2];
+    ucc_mem_map_t maps[1];
     maps[0].address = source;
     maps[0].len     = (size_t)npes * count * sizeof(int64_t);
-    maps[1].address = pSync;
-    maps[1].len     = 5 * sizeof(long);
 
     ucc_lib_h     lib;
     ucc_context_h ucc_context;
     ucc_team_h    ucc_team;
-    if (create_ucc_stack(sub_comm, maps, 2, &lib, &ucc_context, &ucc_team) != 0) {
+    if (create_ucc_stack(sub_comm, maps, 1, &lib, &ucc_context, &ucc_team) != 0) {
         fprintf(stderr, "a2a UCC stack creation failed\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    size_t work_buffer_size = get_ucc_work_buffer_size(ucc_context);
+    pSync = (long *)alloc_zeroed_aligned(work_buffer_size);
+    if (NULL == pSync) {
+        fprintf(stderr, "Failed to allocate UCC work buffer\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -362,7 +393,9 @@ int main(int argc, char ** argv)
             long *a_psync = pSync;
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
-                .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
+                .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS |
+                              UCC_COLL_ARGS_FLAG_IN_PLACE |
+                              UCC_COLL_ARGS_FLAG_PERSISTENT,
                 .coll_type = UCC_COLL_TYPE_ALLTOALL,
                 .src.info  = { .buffer = (void *)source, .count = k * npes,
                                .datatype = UCC_DT_INT64,
@@ -378,21 +411,23 @@ int main(int argc, char ** argv)
                 read_hw_counters(&iter_start_counters, hw_counter_base_path);
             }
 
+            ucc_coll_req_h req = NULL;
+            ucc_status_t status = ucc_collective_init(&coll_args, &req, ucc_team);
+            if (status != UCC_OK) { fprintf(stderr, "coll init failed\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+
             MPI_Barrier(sub_comm);
             start = MPI_Wtime();
-
             for (int z = 0; z < num; z++) {
-                ucc_coll_req_h req = NULL;
-                ucc_status_t status = ucc_collective_init(&coll_args, &req, ucc_team);
-                if (status != UCC_OK) { fprintf(stderr, "coll init failed\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
                 status = ucc_collective_post(req);
                 if (status != UCC_OK) { fprintf(stderr, "FAILED TO POST\n"); abort(); }
                 while (UCC_OK != (status = ucc_collective_test(req))) {
                     if (status < 0) { fprintf(stderr, "collective failed\n"); abort(); }
                     ucc_context_progress(ucc_context);
                 }
-                ucc_collective_finalize(req);
             }
+            ucc_collective_finalize(req);
+
+            MPI_Barrier(sub_comm);
             end = MPI_Wtime();
 
             hw_counter_data_t iter_end_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
@@ -402,8 +437,6 @@ int main(int argc, char ** argv)
                     total_size_counters.counters[j] += (iter_end_counters.counters[j] - iter_start_counters.counters[j]);
                 }
             }
-
-            MPI_Barrier(sub_comm);
 
             if (i >= SKIP) {
                 double time = (end - start);
@@ -435,9 +468,9 @@ int main(int argc, char ** argv)
         MPI_Allreduce(&total, &global_total, 1, MPI_DOUBLE, MPI_SUM, sub_comm);
 
         min_latency = global_min;
-        total_time = total;
+        total_time = global_total;
         max_latency = global_max;
-        double n = (double)npes * (iter - SKIP);
+        double n = (double)npes * (double)iter;
         double avg_time = global_total / npes;
         double global_mean = global_total / n;
         double local_dev_sq = welford_M2 + (welford_mean - global_mean) *
@@ -447,7 +480,7 @@ int main(int argc, char ** argv)
         double variance_us2 = (global_dev_sq / n) * 1e12;
 
         total_bw  = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
-        bandwidth = (npes * (k * sizeof(uint64_t)) * (iter - SKIP)) / (total_time);
+        bandwidth = (npes * (k * sizeof(uint64_t)) * (double)iter) / avg_time;
         src_buff  = bandwidth;
 
         MPI_Allreduce(&src_buff, &agg_bandwidth, 1, MPI_DOUBLE, MPI_SUM, sub_comm);
@@ -459,7 +492,7 @@ int main(int argc, char ** argv)
                    (bandwidth / (1024 * 1024)) * ppn,
                    agg_bandwidth / (1024 * 1024),
                    total_bw * ppn,
-                   (avg_time * 1e6) / (iter - SKIP),
+                   (avg_time * 1e6) / (double)iter,
                    min_latency * 1e6,
                    max_latency * 1e6,
                    variance_us2);
@@ -479,7 +512,13 @@ int main(int argc, char ** argv)
     /* Signal odd ranks to stop the background allreduce. */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    ucc_team_destroy(ucc_team);
+    ucc_status_t destroy_status;
+    while (UCC_INPROGRESS == (destroy_status = ucc_team_destroy(ucc_team))) {
+        ucc_context_progress(ucc_context);
+    }
+    if (UCC_OK != destroy_status) {
+        fprintf(stderr, "a2a team destroy failed: %d\n", destroy_status);
+    }
     ucc_context_destroy(ucc_context);
     ucc_finalize(lib);
 

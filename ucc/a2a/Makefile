@@ -21,7 +21,8 @@ ucc_bench_a2a_mpi_ar: ucc_bench_a2a_mpi_ar.c
 	${CC} ${CFLAGS} ucc_bench_a2a_mpi_ar.c -o ucc_bench_a2a_mpi_ar ${LDFLAGS}
 
 ucc_bench_a2a_shrink: ucc_bench_a2a_shrink.c
-	${CC} ${CFLAGS} ucc_bench_a2a_shrink.c -o ucc_bench_a2a_shrink ${LDFLAGS}
+	${CC} ${CFLAGS} ucc_bench_a2a_shrink.c -o ucc_bench_a2a_shrink ${LDFLAGS} || \
+	    echo "WARNING: ucc_bench_a2a_shrink skipped (UCC FT APIs not available in this version)"
 
 clean:
 	rm ucc_bench_a2a ucc_bench_a2a_basic ucc_bench_a2a_verify ucc_bench_a2a_mpi ucc_bench_a2a_mpi_ar ucc_bench_a2a_shrink

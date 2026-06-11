@@ -56,6 +56,20 @@ struct params {
 };
 typedef struct params params_t;
 
+static int rows_for_pe(int pe, int npes)
+{
+    int base = M / npes;
+    int rem = M % npes;
+    return base + (pe < rem);
+}
+
+static int first_row_for_pe(int pe, int npes)
+{
+    int base = M / npes;
+    int rem = M % npes;
+    return pe * base + (pe < rem ? pe : rem);
+}
+
 void foo(float ** a, float ** b, float * c, float * d, int start, int stop, int nr_rows)
 {
     int i = 0, j = 0;
@@ -92,13 +106,15 @@ int main(int argc, char ** argv) {
     me = shmem_my_pe();
     npes = shmem_n_pes();
    
-    nr_rows = M / npes;
-    a = (float **) shmemx_malloc_with_hint(sizeof(float *) * (nr_rows), SHMEM_HINT_LOW_LAT_MEM);
-    b = (float **) shmemx_malloc_with_hint(sizeof(float *) * (nr_rows), SHMEM_HINT_LOW_LAT_MEM);
+    nr_rows = rows_for_pe(me, npes);
+    int first_row = first_row_for_pe(me, npes);
+    int max_rows = (M + npes - 1) / npes;
+    a = (float **) shmemx_malloc_with_hint(sizeof(float *) * max_rows, SHMEM_HINT_LOW_LAT_MEM);
+    b = (float **) shmemx_malloc_with_hint(sizeof(float *) * max_rows, SHMEM_HINT_LOW_LAT_MEM);
     c = (float *) shmemx_malloc_with_hint(sizeof(float) * M, SHMEM_HINT_NEAR_NIC_MEM);
     d = (float *) shmemx_malloc_with_hint(sizeof(float) * M, SHMEM_HINT_NEAR_NIC_MEM);
 
-    for (j = 0; j < (nr_rows); j++) {
+    for (j = 0; j < max_rows; j++) {
         a[j] = (float *) shmemx_malloc_with_hint(sizeof(float) * M, SHMEM_HINT_LOW_LAT_MEM);
         b[j] = (float *) shmemx_malloc_with_hint(sizeof(float) * M, SHMEM_HINT_LOW_LAT_MEM);
         memset(b[j], 0, sizeof(float) * M);
@@ -114,8 +130,8 @@ int main(int argc, char ** argv) {
     up = (me == 0) ? -1 : me - 1;
     down = (me == (npes - 1)) ? -1 : me + 1;
     
-    start = (me == 0) ? 1 : 0;
-    stop = (me != npes - 1 && npes > 1) ? nr_rows : nr_rows - 1;
+    start = (first_row == 0) ? 1 : 0;
+    stop = (first_row + nr_rows == M) ? nr_rows - 1 : nr_rows;
 
     shmem_barrier_all();
     time1 = TIME();
@@ -123,7 +139,8 @@ int main(int argc, char ** argv) {
         int l = 0;
         
         if (me != 0) {
-            shmem_float_get(c, a[nr_rows - 1], M, up);
+            int up_rows = rows_for_pe(up, npes);
+            shmem_float_get(c, a[up_rows - 1], M, up);
         } 
         if (me != (npes -1)) {
             shmem_float_get(d, a[0], M, down);

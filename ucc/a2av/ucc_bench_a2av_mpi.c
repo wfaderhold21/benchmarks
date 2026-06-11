@@ -37,9 +37,13 @@ int verify(const void * src, const int64_t * dest, int64_t *src_count, ucc_aint_
     MPI_Alltoallv(src, mpi_src_count, mpi_src_disp, MPI_LONG, t_dest, mpi_dst_count, mpi_dst_disp, MPI_LONG, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
     for (int i = 0; i < npes; i++) {
-        if (dest[i] != t_dest[i]) {
-            printf("[%d] error: does not validate on index i: %d (%ld != %ld)\n", rank, i, dest[i], t_dest[i]);
-            return -1;
+        for (int64_t j = 0; j < dst_count[i]; j++) {
+            ucc_aint_t idx = dst_disp[i] + j;
+            if (dest[idx] != t_dest[idx]) {
+                printf("[%d] error: does not validate on index %ld (%ld != %ld)\n",
+                       rank, (long)idx, dest[idx], t_dest[idx]);
+                return -1;
+            }
         }
     }
     free(t_dest);
@@ -84,15 +88,36 @@ static ucc_status_t oob_allgather_free(void *req)
     return UCC_OK;
 }
 
+static size_t get_ucc_work_buffer_size(ucc_context_h ctx)
+{
+    ucc_context_attr_t attr;
+
+    attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ctx, &attr) ||
+        attr.global_work_buffer_size == 0) {
+        return 5 * sizeof(long);
+    }
+    return attr.global_work_buffer_size;
+}
+
+static void *alloc_zeroed_aligned(size_t size)
+{
+    void *ptr = NULL;
+
+    if (posix_memalign(&ptr, 4096, size) != 0) {
+        return NULL;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
 int main(int argc, char ** argv)
 {
     int me;
     int npes;
     int count = 32768;  // Reduced to avoid memory registration issues
-    long * pSync;
-    long * pSync2;
-    long * pSync3;
-    double * pWrk;
+    long * pSync = NULL;
+    long * pSync2 = NULL;
     static long val = 9999;
     static double min_latency, max_latency;
     static double total_time = 0.0;
@@ -156,46 +181,22 @@ int main(int argc, char ** argv)
         printf("Failed to allocate aligned memory for source\n");
         return -1;
     }
-    int64_t* dest = source;
-
-    // Allocate synchronization arrays with proper alignment
-    if (posix_memalign((void**)&pSync, 4096, sizeof(long) * 5) != 0) {
-        printf("Failed to allocate aligned memory for pSync\n");
-        return -1;
-    }
-    if (posix_memalign((void**)&pSync2, 4096, sizeof(long) * 5) != 0) {
-        printf("Failed to allocate aligned memory for pSync2\n");
-        return -1;
-    }
-    if (posix_memalign((void**)&pSync3, 4096, sizeof(long) * 5) != 0) {
-        printf("Failed to allocate aligned memory for pSync3\n");
-        return -1;
-    }
-    if (posix_memalign((void**)&pWrk, 4096, sizeof(double) * 5) != 0) {
-        printf("Failed to allocate aligned memory for pWrk\n");
+    int64_t* dest;
+    if (posix_memalign((void**)&dest, 4096, npes * count * sizeof(int64_t)) != 0) {
+        printf("Failed to allocate aligned memory for dest\n");
         return -1;
     }
 
-    for (int i = 0; i < 5; i++) {
-        pSync[i] = 0;
-        pSync2[i] = 0;
-        pSync3[i] = 1;  // MPI equivalent of SHMEM_SYNC_VALUE
-    }
-
-    maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t) * 4);
+    maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t) * 2);
     if (maps == NULL) {
         printf("OOM\n");
         return -1;
     }
 
     maps[0].address = source;
-    maps[0].len = 2 * npes * count * sizeof(int64_t);
-    maps[1].address = pSync;
-    maps[1].len = 5 * sizeof(long);
-    maps[2].address = pSync2;
-    maps[2].len = 5 * sizeof(long);
-    maps[3].address = pSync3;
-    maps[3].len = 5 * sizeof(long);
+    maps[0].len = npes * count * sizeof(int64_t);
+    maps[1].address = dest;
+    maps[1].len = npes * count * sizeof(int64_t);
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
@@ -204,7 +205,7 @@ int main(int argc, char ** argv)
     ctx_params.oob.coll_info = (void *)MPI_COMM_WORLD;
     ctx_params.oob.n_oob_eps = npes;
     ctx_params.oob.oob_ep = me;
-    ctx_params.mem_params.n_segments = 4;
+    ctx_params.mem_params.n_segments = 2;
     ctx_params.mem_params.segments = maps;
 
     ucc_lib_params_t lib_params = {
@@ -235,6 +236,14 @@ int main(int argc, char ** argv)
 
     ucc_context_config_release(ctx_config);
 
+    size_t work_buffer_size = get_ucc_work_buffer_size(ucc_context);
+    pSync = (long *)alloc_zeroed_aligned(work_buffer_size);
+    pSync2 = (long *)alloc_zeroed_aligned(work_buffer_size);
+    if (NULL == pSync || NULL == pSync2) {
+        printf("Failed to allocate UCC work buffers\n");
+        return -1;
+    }
+
     team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS;
     team_params.oob.allgather = oob_allgather;
     team_params.oob.req_test = oob_allgather_test;
@@ -250,7 +259,9 @@ int main(int argc, char ** argv)
         return -1; 
     }   
 
-    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {}
+    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {
+        ucc_context_progress(ucc_context);
+    }
     if (UCC_OK != status) {
         printf("team create failed\n");
         return -1; 
@@ -290,14 +301,14 @@ int main(int argc, char ** argv)
         }
 
         /* alltoallv */
-        for (int i = 0; i < NR_ITER + SKIP; i++) {
+        for (int i = 0; i < (int)iter + SKIP; i++) {
             long * a_psync = (i % 2) ? pSync : pSync2;
-            double b_start, b_end;
 
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
                 .flags     = UCC_COLL_ARGS_FLAG_COUNT_64BIT | UCC_COLL_ARGS_FLAG_DISPLACEMENTS_64BIT 
-                           | UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
+                           | UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS
+                           | UCC_COLL_ARGS_FLAG_PERSISTENT,
                 .coll_type = UCC_COLL_TYPE_ALLTOALLV,
                 .src.info_v =
                     {
@@ -341,13 +352,13 @@ int main(int argc, char ** argv)
                     }
                     ucc_context_progress(ucc_context);
                 }
-                ucc_collective_finalize(req);
             }
-            end = MPI_Wtime();
+            ucc_collective_finalize(req);
 
             MPI_Barrier(MPI_COMM_WORLD);
+            end = MPI_Wtime();
 
-            if (i > SKIP) {
+            if (i >= SKIP) {
                 double time = (end - start);
                 total += time;
                 if (time < min) {
@@ -367,12 +378,12 @@ int main(int argc, char ** argv)
         MPI_Allreduce(&total, &global_total, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         
         min_latency = global_min;
-        total_time = total;  // Use local total for bandwidth (like OpenSHMEM)
+        total_time = global_total;
         max_latency = global_max;
         double avg_time = global_total / npes;  // Global average time for latency calculation
         
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
-        bandwidth = (npes * (k * sizeof(uint64_t)) * (iter - SKIP)) / (total_time);
+        bandwidth = (npes * (k * sizeof(uint64_t)) * (double)iter) / avg_time;
         src_buff = bandwidth;
         
         // Aggregate bandwidth across all processes
@@ -384,7 +395,7 @@ int main(int argc, char ** argv)
             printf("%15.2f", (bandwidth / (1024 * 1024)));
             printf("%13.2f", agg_bandwidth / (1024 * 1024));
             printf("%13.2f", total_bw);
-            printf("%13.2f", (avg_time * 1e6) / ((iter - SKIP)));
+            printf("%13.2f", (avg_time * 1e6) / (double)iter);
             printf("%13.2f", min_latency * 1e6);
             printf("%13.2f", max_latency * 1e6);
             printf("\n");
@@ -395,10 +406,9 @@ int main(int argc, char ** argv)
     
     // Cleanup
     free(source);
+    free(dest);
     free(pSync);
     free(pSync2);
-    free(pSync3);
-    free(pWrk);
     free(maps);
     free(src_count);
     free(dst_count);
@@ -407,4 +417,4 @@ int main(int argc, char ** argv)
     
     MPI_Finalize();
     return 0;
-} 
+}

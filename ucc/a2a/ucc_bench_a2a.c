@@ -155,6 +155,18 @@ static ucc_status_t oob_allgather_free(void *req)
     return UCC_OK;
 }
 
+static size_t get_ucc_work_buffer_size(ucc_context_h ctx)
+{
+    ucc_context_attr_t attr;
+
+    attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ctx, &attr) ||
+        attr.global_work_buffer_size == 0) {
+        return 5 * sizeof(long);
+    }
+    return attr.global_work_buffer_size;
+}
+
 int main(int argc, char ** argv)
 {
     int me;
@@ -165,7 +177,7 @@ int main(int argc, char ** argv)
     long * pSync3;
     double * pWrk;
     static long val = 9999;
-    static double min_latency, max_latency;
+    static double min_latency, max_latency, global_max_latency;
     static double total_time = 0.0;
     static double start, end, total = 0.0;
     static double src_buff, dest_buff;
@@ -219,14 +231,10 @@ int main(int argc, char ** argv)
 #endif
     int64_t* dest = source;
 
-    pSync = (long *) shmem_malloc(sizeof(long) * (5));
-    pSync2 = (long *) shmem_malloc(sizeof(long) * (5));//SHMEM_ALLTOALL_SYNC_SIZE);
     pSync3 = (long *) shmem_malloc(sizeof(long) * SHMEM_REDUCE_SYNC_SIZE);
     pWrk = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
 
-    for (int i = 0; i < 5; i++) {
-        pSync[i] = 0;
-        pSync2[i] = 0;
+    for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
         pSync3[i] = SHMEM_SYNC_VALUE;
     }
 
@@ -238,26 +246,10 @@ int main(int argc, char ** argv)
 
 #ifndef WITH_MEMH
     maps[0].address = source;
-    maps[0].len = 2 * npes * count * sizeof(int64_t);
-    maps[1].address = pSync;
-    maps[1].len = 5 * sizeof(long);
-    maps[2].address = pSync2;
-    maps[2].len = 5 * sizeof(long);
-    maps[3].address = pSync3;
-    maps[3].len = SHMEM_REDUCE_SYNC_SIZE * sizeof(long);
-    maps[4].address = pWrk;
-    maps[4].len = SHMEM_REDUCE_MIN_WRKDATA_SIZE * sizeof(double);
-    ctx_params.mem_params.n_segments = 5;
+    maps[0].len = npes * count * sizeof(int64_t);
+    ctx_params.mem_params.n_segments = 1;
 #else
-    maps[0].address = pSync;
-    maps[0].len = 5 * sizeof(long);
-    maps[1].address = pSync2;
-    maps[1].len = 5 * sizeof(long);
-    maps[2].address = pSync3;
-    maps[2].len = SHMEM_REDUCE_SYNC_SIZE * sizeof(long);
-    maps[3].address = pWrk;
-    maps[3].len = SHMEM_REDUCE_MIN_WRKDATA_SIZE * sizeof(double);
-    ctx_params.mem_params.n_segments = 4;
+    ctx_params.mem_params.n_segments = 0;
 #endif
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
@@ -297,6 +289,15 @@ int main(int argc, char ** argv)
 
     ucc_context_config_release(ctx_config);
 
+    size_t work_buffer_size = get_ucc_work_buffer_size(ucc_context);
+    pSync = (long *)shmem_calloc(1, work_buffer_size);
+    pSync2 = (long *)shmem_calloc(1, work_buffer_size);
+    if (NULL == pSync || NULL == pSync2) {
+        printf("OOM: UCC work buffers\n");
+        return -1;
+    }
+    shmem_barrier_all();
+
     team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS;
     team_params.oob.allgather = oob_allgather;
     team_params.oob.req_test = oob_allgather_test;
@@ -312,7 +313,9 @@ int main(int argc, char ** argv)
         return -1; 
     }   
 
-    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {}
+    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {
+        ucc_context_progress(ucc_context);
+    }
     if (UCC_OK != status) {
         printf("team create failed\n");
         return -1; 
@@ -380,10 +383,11 @@ int main(int argc, char ** argv)
         /* alltoall */
         for (int i = 0; i < iter + SKIP; i++) {
             long * a_psync = (i % 2) ? pSync : pSync2;
-            double b_start, b_end;
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
-                .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
+                .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS |
+                              UCC_COLL_ARGS_FLAG_IN_PLACE |
+                              UCC_COLL_ARGS_FLAG_PERSISTENT,
                 .coll_type = UCC_COLL_TYPE_ALLTOALL,
                 .src.info =
                     {
@@ -435,11 +439,12 @@ int main(int argc, char ** argv)
                     }
                     ucc_context_progress(ucc_context);
                 }
-                ucc_collective_finalize(req);
             }
+            ucc_collective_finalize(req);
 #ifdef WITH_BASIC
                 shmem_barrier_all();
 #endif
+            shmem_barrier_all();
             end = MPI_Wtime();
 
             // Stop hardware counter measurement for this iteration
@@ -452,15 +457,13 @@ int main(int argc, char ** argv)
                 }
             }
 
-            shmem_barrier_all();
-
             #ifdef WITH_VERIFY
             /*int ret = verify(source, dest, src_count, src_disp, dst_count, dst_disp, k, me, npes);
             if (ret != 0) {
                 return ret;
             }*/
             #endif
-            if (i > SKIP) {
+            if (i >= SKIP) {
                 double time = (end - start);
                 total += time;// - (b_end - b_start);
                 if (time < min) {
@@ -492,10 +495,13 @@ int main(int argc, char ** argv)
 
         shmem_double_min_to_all(&min_latency, &min, 1, 0, 0, npes, pWrk, pSync3);
         shmem_barrier_all();
+        shmem_double_max_to_all(&global_max_latency, &max_latency, 1, 0, 0, npes, pWrk, pSync3);
+        max_latency = global_max_latency;
+        shmem_barrier_all();
         shmem_double_sum_to_all(&total_time, &total, 1, 0, 0, npes, pWrk, pSync3);
-        total_time = total;
+        double avg_time = total_time / npes;
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
-        bandwidth = (npes * (k * sizeof(uint64_t)) * (NR_ITER - SKIP)) / (total_time);
+        bandwidth = (npes * (k * sizeof(uint64_t)) * (double)iter) / avg_time;
         src_buff = bandwidth;
         shmem_barrier_all();
         shmem_double_sum_to_all(&dest_buff, &src_buff, 1, 0, 0, npes, pWrk, pSync3); 
@@ -508,7 +514,7 @@ int main(int argc, char ** argv)
             printf("%15.2f", (bandwidth / (1024 * 1024)) * ppn);
             printf("%13.2f", agg_bandwidth / (1024 * 1024));
             printf("%13.2f", total_bw);
-            printf("%13.2f", (total_time * 1e6) / ((NR_ITER - SKIP)));
+            printf("%13.2f", (avg_time * 1e6) / (double)iter);
             printf("%13.2f", min_latency * 1e6);
             printf("%13.2f", max_latency * 1e6);
 

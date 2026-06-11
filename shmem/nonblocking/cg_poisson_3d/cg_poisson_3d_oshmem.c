@@ -40,7 +40,7 @@
 double gt1, gt2, gt3, gt4;
 static long pSync[SHMEM_ALLTOALL_SYNC_SIZE];
 static long max_pSync[SHMEM_REDUCE_SYNC_SIZE];
-static size_t max_pWrk[SHMEM_REDUCE_MIN_WRKDATA_SIZE];
+static long max_pWrk[SHMEM_REDUCE_MIN_WRKDATA_SIZE];
 static long dot_pSync[SHMEM_REDUCE_SYNC_SIZE];
 static double dot_pWrk[SHMEM_REDUCE_MIN_WRKDATA_SIZE];
 
@@ -86,12 +86,19 @@ struct comm_data_t
   int                npes;
   int                dims[3];
   int                coords[3];
-  shmem_req_h        req;  /* OpenSHMEM request handle for non-blocking operations */
+  long               nb_ctr; /* completion counter for shmemx_alltoall_global_nb */
   /* Buffer management for non-blocking operations */
   double            *padded_send;
   double            *padded_recv;
   size_t            nelems;
 };
+
+static double wall_time(void)
+{
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+}
 struct comm_data_t    comm_data;
 
 /* =========
@@ -415,7 +422,7 @@ void plane_buffer_mult(struct plane *p, double* buffer)
   int i, j;
   for (i= 0; i < p->major_dim; i++) {
     for (j= 0; j < p->minor_dim; j++) {
-      buffer[i * p->major_dim + j]= p->first[i * p->major_inc + j * p->minor_inc];
+      buffer[i * p->minor_dim + j]= p->first[i * p->major_inc + j * p->minor_inc];
     }
   }
 }
@@ -425,7 +432,7 @@ void plane_buffer_copy(struct plane *p, double* buffer)
   int i, j;
   for (i= 0; i < p->major_dim; i++) {
     for (j= 0; j < p->minor_dim; j++) {
-      p->first[i * p->major_inc + j * p->minor_inc]= buffer[i * p->major_dim + j];
+      p->first[i * p->major_inc + j * p->minor_inc]= buffer[i * p->minor_dim + j];
     }
   }
 }
@@ -557,7 +564,7 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
   static double          *padded_recv = NULL;
   static size_t          padded_size = 0;
 
-  t1 = MPI_Wtime();
+  t1 = wall_time();
 
   /* copy data to send buffers */
   fill_buffers(v, &comm_data->send_buffers);
@@ -568,7 +575,9 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
            comm_data->send_buffers.top + comm_data->send_buffers.bottom;
 
   /* Find maximum elements across all PEs */
-  shmem_long_max_to_all(&max_nelems, (long*)&nelems, 1, 0, 0, comm_data->npes, max_pWrk, max_pSync);
+  long nelems_local = (long)nelems;
+  shmem_long_max_to_all(&max_nelems, &nelems_local, 1, 0, 0,
+                        comm_data->npes, max_pWrk, max_pSync);
   
   /* Add debug output for large problems */
   if (comm_data->rank == 0 && max_nelems > 100000) {
@@ -594,11 +603,11 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
 
   if (comm_data->non_blocking) {
     /* Use non-blocking alltoall for boundary exchange */
-    shmemx_alltoall_nb(SHMEM_TEAM_WORLD,
-                      padded_recv,                    /* dest */
-                      padded_send,                    /* source */
-                      max_nelems,                     /* nelems */
-                      &comm_data->req);              /* req */
+    comm_data->nb_ctr = 0;
+    shmemx_alltoall_global_nb(padded_recv,            /* dest */
+                              padded_send,            /* source */
+                              max_nelems * sizeof(double), /* size in bytes */
+                              &comm_data->nb_ctr);    /* counter */
     
     /* For non-blocking, store buffer pointers for later cleanup */
     comm_data->padded_send = padded_send;
@@ -622,18 +631,19 @@ void start_send_boundaries(struct array_3d *v, struct comm_data_t *comm_data)
     shmem_free(padded_recv);
   }
 
-  t2 = MPI_Wtime();
+  t2 = wall_time();
   gt1 += t2 - t1;
 }
 
 void finish_send_boundaries(struct comm_data_t *comm_data)
 {
   double t1, t2;
-  t1 = MPI_Wtime();
+  t1 = wall_time();
   
   if (comm_data->non_blocking) {
     /* Wait for non-blocking alltoall to complete */
-    shmem_req_wait(&comm_data->req);
+    shmem_long_wait(&comm_data->nb_ctr, 0);
+    comm_data->nb_ctr = 0;
     
     /* Now safe to copy data and free buffers */
     memcpy(comm_data->recv_buffers.start, comm_data->padded_recv, comm_data->nelems * sizeof(double) * comm_data->npes);
@@ -643,7 +653,7 @@ void finish_send_boundaries(struct comm_data_t *comm_data)
     shmem_free(comm_data->padded_recv);
   }
   
-  t2 = MPI_Wtime();
+  t2 = wall_time();
   gt2 += t2 - t1;
 }
 
@@ -689,7 +699,7 @@ void matrix_vector_mult(struct array_3d *v_in, struct array_3d *v_out,
                       struct comm_data_t *comm_data)
 {
   double t1, t2;
-  t1 = MPI_Wtime();
+  t1 = wall_time();
 
   check_same_dimensions(v_in, v_out);
 
@@ -714,7 +724,7 @@ void matrix_vector_mult(struct array_3d *v_in, struct array_3d *v_out,
   }
   mult_boundaries(v_in, &comm_data->recv_buffers);
 
-  t2 = MPI_Wtime();
+  t2 = wall_time();
   gt3 += t2 - t1;
 }
 
@@ -774,6 +784,22 @@ void vector_assign_add(struct array_3d *v, struct array_3d *w)
   }
 }
 
+void vector_assign_add_scaled(struct array_3d *v, struct array_3d *w, double scale)
+{
+  int i;
+  for (i= 0; i < vector_size(v); i++) {
+    v->array[i]+= scale * w->array[i];
+  }
+}
+
+void vector_assign_r_plus_beta_v(struct array_3d *v, struct array_3d *r, double beta)
+{
+  int i;
+  for (i= 0; i < vector_size(v); i++) {
+    v->array[i]= r->array[i] + beta * v->array[i];
+  }
+}
+
 double parallel_dot(struct array_3d *v, struct array_3d *w, struct comm_data_t *comm_data)
 {
   int i;
@@ -798,7 +824,7 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
   int                  max_iter= 200;
   double               t1, t2;
 
-  t1 = MPI_Wtime();
+  t1 = wall_time();
 
   if (comm_data->rank == 0) {
     DEBUG_PRINT("Initializing conjugate gradient arrays...\n");
@@ -815,7 +841,7 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
   matrix_vector_mult(x, &v, comm_data);
   set_array_3d(&r, 0.0);
   vector_assign_add(&r, b);
-  vector_assign_add(&r, &v);
+  vector_assign_add_scaled(&r, &v, -1.0);
 
   /* v = r */
   memcpy(v.array, r.array, vector_size(&r) * sizeof(double));
@@ -835,8 +861,8 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
     }
     matrix_vector_mult(&v, &q, comm_data);
     alpha= rho / parallel_dot(&v, &q, comm_data);
-    vector_assign_add(x, &v);
-    vector_assign_add(&r, &q);
+    vector_assign_add_scaled(x, &v, alpha);
+    vector_assign_add_scaled(&r, &q, -alpha);
     rho_old= rho;
     rho= parallel_dot(&r, &r, comm_data);
     
@@ -851,7 +877,7 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
       break;
     }
     beta= rho / rho_old;
-    vector_assign_add(&v, &r);
+    vector_assign_r_plus_beta_v(&v, &r, beta);
   }
   
   if (i >= max_iter && comm_data->rank == 0) {
@@ -862,7 +888,7 @@ int conjugate_gradient(struct array_3d *b, struct array_3d *x, double rel_error,
   shmem_free(q.array);
   shmem_free(r.array);
 
-  t2 = MPI_Wtime();
+  t2 = wall_time();
   gt4 += t2 - t1;
 
   if (comm_data->rank == 0) {
@@ -909,13 +935,14 @@ int main(int argc, char** argv)
     max_pSync[i] = SHMEM_SYNC_VALUE;
     dot_pSync[i] = SHMEM_SYNC_VALUE;
   }
+  shmem_barrier_all();
 
   /* First run with blocking version */
   if (comm_data.rank == 0) {
     DEBUG_PRINT("\n=== Starting Blocking Version ===\n");
   }
   comm_data.non_blocking = 0;
-  t1 = MPI_Wtime();
+  t1 = wall_time();
 
   init_processor_grid(&comm_data);
   allocate_vectors(&x, &b, argc, argv, &comm_data);
@@ -927,7 +954,7 @@ int main(int argc, char** argv)
   }
   iter = conjugate_gradient(&b, &x, rel_error, &comm_data);
 
-  t2 = MPI_Wtime();
+  t2 = wall_time();
   blocking_time = t2 - t1;
   
   if (comm_data.rank == 0) {
@@ -957,7 +984,7 @@ int main(int argc, char** argv)
     DEBUG_PRINT("\n=== Starting Non-Blocking Version ===\n");
   }
   comm_data.non_blocking = 1;
-  t3 = MPI_Wtime();
+  t3 = wall_time();
 
   init_processor_grid(&comm_data);
   allocate_vectors(&x, &b, argc, argv, &comm_data);
@@ -969,7 +996,7 @@ int main(int argc, char** argv)
   }
   iter = conjugate_gradient(&b, &x, rel_error, &comm_data);
 
-  t4 = MPI_Wtime();
+  t4 = wall_time();
   nonblocking_time = t4 - t3;
   
   if (comm_data.rank == 0) {

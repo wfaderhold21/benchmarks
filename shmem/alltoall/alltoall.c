@@ -43,7 +43,10 @@ double myalltoall(void * dest, const void * source, size_t nelems, size_t selems
     double start = TIME(), end = 0;
 
     for (; i < PE_size; i += stride) {
-        shmem_putmem((void *)((char *) dest + selems * mystarting_index), source, nelems * selems, i);
+        int peer_index = (i - PE_start) / stride;
+        const void *src_chunk = (const char *)source + selems * nelems * peer_index;
+        shmem_putmem((void *)((char *) dest + selems * mystarting_index),
+                     src_chunk, nelems * selems, i);
     }
     shmem_quiet();
     end = TIME();
@@ -56,6 +59,7 @@ int main(void)
     int nr_elems;
     int my_pe, n_pes;
     long * pSync =NULL;
+    long * pSyncReduce = NULL;
     double *pWork = NULL;
     data_t * data;
     data_t * alldata;
@@ -66,14 +70,20 @@ int main(void)
     n_pes = shmem_n_pes();
 
 #if WITH_HINTS
-    pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_NUMA_1);
+    pSync = (long *) shmemx_malloc_with_hint(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE, SHMEM_HINT_LOW_LAT_MEM);
     pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
 #else
     pSync = (long *) shmem_malloc(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE);
+    pWork = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
 #endif
+    pSyncReduce = (long *) shmem_malloc(sizeof(long) * SHMEM_REDUCE_SYNC_SIZE);
     for (i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
         pSync[i] = SHMEM_SYNC_VALUE;
     }
+    for (i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
+        pSyncReduce[i] = SHMEM_SYNC_VALUE;
+    }
+    shmem_barrier_all();
 
     for (i = 0; i <= 18; i++) {
         nr_elems = (1 << i);
@@ -83,14 +93,14 @@ int main(void)
         int j = 0, k = 0;
 
 #if WITH_HINTS
-        data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems, SHMEM_HINT_NUMA_1);
-        alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes , SHMEM_HINT_NUMA_1);
+        data = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes, SHMEM_HINT_LOW_LAT_MEM);
+        alldata = (data_t *) shmemx_malloc_with_hint(sizeof(data_t) * nr_elems * n_pes , SHMEM_HINT_LOW_LAT_MEM);
 #else
-        data = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems);
+        data = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems * n_pes);
         alldata = (data_t *) shmem_malloc(sizeof(data_t) * nr_elems * n_pes);
 #endif
 
-        for (j = 0; j < nr_elems; j++) {
+        for (j = 0; j < nr_elems * n_pes; j++) {
             data[j].data = (long) my_pe * i + j;
         }               
 
@@ -106,7 +116,7 @@ int main(void)
         }
         f_end = TIME();
         latency = ((f_end - f_start)) / MAX_ITER; // in us
-        size = (1.0 * n_pes * MAX_ITER * nr_elems); // bytes
+        size = (1.0 * n_pes * MAX_ITER * nr_elems * sizeof(data_t)); // bytes
         bandwidth = size / (i_time / 1e6);
 
         {   double *src_buff = NULL, *dest_buff = NULL, agg_bw;
@@ -114,14 +124,17 @@ int main(void)
 		    dest_buff = shmem_malloc(sizeof(double));
 
 			*src_buff = bandwidth;
-			shmem_double_sum_to_all(dest_buff, src_buff, 1,0,0,n_pes,pWork,pSync);
+            shmem_barrier_all();
+			shmem_double_sum_to_all(dest_buff, src_buff, 1,0,0,n_pes,pWork,pSyncReduce);
 		
 			agg_bw = *dest_buff;
 
 			if (0 == shmem_my_pe()) {
 				fprintf(stdout,"Aggreate bandwidth %g MB/s\n", agg_bw/(1024 * 1024));
-			}
+				}
 
+            shmem_free(src_buff);
+            shmem_free(dest_buff);
         }
         
 	
@@ -156,4 +169,3 @@ int main(void)
     shmem_finalize();
     return 0;
 }
-

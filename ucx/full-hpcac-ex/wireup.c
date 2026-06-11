@@ -99,7 +99,7 @@ int reg_buffer(void * buffer, size_t length)
             goto fail_full;
         }
 
-        ucp_rkey_buffer_release(pack[i]); 
+        free(pack[i]);
         pack[i] = NULL;
     }
 
@@ -268,7 +268,9 @@ int comm_finalize()
 
 int cmpfunc(const void * a, const void * b) 
 {
-    return ((*(double *)a) - (*(double *)b));
+    double aa = *(const double *)a;
+    double bb = *(const double *)b;
+    return (aa > bb) - (aa < bb);
 }
 
 void put_lat(char * sdata, int iter, int skip, size_t data_size)
@@ -322,7 +324,7 @@ void put_lat(char * sdata, int iter, int skip, size_t data_size)
             times[i] = times[i] - total;
             variance += times[i] * times[i];
         }
-        variance = variance / iter;
+        variance = variance / (iter - skip);
         printf("size: %ld\n", data_size);
         printf("put avg lat: %0.2f us\n", total);
         printf("put median lat: %0.2f us\n", median);

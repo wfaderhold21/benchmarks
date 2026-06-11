@@ -16,6 +16,13 @@
 #define NR_ITER     110
 #define SKIP        10
 
+static double wall_time(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+}
+
 int main(int argc, char ** argv)
 {
     shmem_init();
@@ -30,7 +37,7 @@ int main(int argc, char ** argv)
     static long val = 9999;
     int64_t* dest = (int64_t*) shmem_malloc(count * npes * sizeof(int64_t));
     int64_t* source = (int64_t*) shmem_malloc(count * npes * sizeof(int64_t));
-    static double min_latency, max_latency;
+    static double min_latency, max_latency, global_max_latency;
     static double src_buff, dest_buff;
     static double total_time = 0.0;
     static double start, end, total = 0.0;
@@ -41,20 +48,19 @@ int main(int argc, char ** argv)
         count = size;
     }
 
-    pSync = (long *) shmem_malloc(sizeof(long) * (5));
-    pSync2 = (long *) shmem_malloc(sizeof(long) * (5));//SHMEM_ALLTOALL_SYNC_SIZE);
+    pSync = (long *) shmem_malloc(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE);
+    pSync2 = (long *) shmem_malloc(sizeof(long) * SHMEM_ALLTOALL_SYNC_SIZE);
     pSync3 = (long *) shmem_malloc(sizeof(long) * SHMEM_REDUCE_SYNC_SIZE);
     pWrk = (double *) shmem_malloc(sizeof(double) * SHMEM_REDUCE_MIN_WRKDATA_SIZE);
 
     for (int i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
         pSync[i] = SHMEM_SYNC_VALUE;
         pSync2[i] = SHMEM_SYNC_VALUE;
+    }
+    for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
         pSync3[i] = SHMEM_SYNC_VALUE;
     }
-    for (int i = 0; i < 5; i++) {
-        pSync[i] = 0;
-        pSync2[i] = 0;
-    }
+    shmem_barrier_all();
 
     /* assign source values */
     for (int pe = 0; pe < npes; pe++) {
@@ -84,14 +90,14 @@ int main(int argc, char ** argv)
         total = 0;
         
         /* alltoall */
+        shmem_barrier_all();
         for (int i = 0; i < NR_ITER; i++) {
             long * a_psync = (i % 2) ? pSync : pSync2;
-            double b_start, b_end;
-            start = MPI_Wtime();
+            start = wall_time();
             shmem_alltoall64(dest, source, k, 0, 0, npes, a_psync);
-            end = MPI_Wtime();
+            end = wall_time();
 
-            if (i > SKIP) {
+            if (i >= SKIP) {
                 double time = end - start;
                 total += time;// - (b_end - b_start);
                 if (time < min) {
@@ -104,12 +110,15 @@ int main(int argc, char ** argv)
             shmem_barrier_all();
         }
 
-        shmem_double_min_to_all(&min_latency, &min, 1, 0, 0, npes, pWrk, pSync2);
+        shmem_double_min_to_all(&min_latency, &min, 1, 0, 0, npes, pWrk, pSync3);
         shmem_barrier_all();
-        shmem_double_sum_to_all(&total_time, &total, 1, 0, 0, npes, pWrk, pSync);
-        total_time = total;//total_time / (npes);
+        shmem_double_max_to_all(&global_max_latency, &max_latency, 1, 0, 0, npes, pWrk, pSync3);
+        max_latency = global_max_latency;
+        shmem_barrier_all();
+        shmem_double_sum_to_all(&total_time, &total, 1, 0, 0, npes, pWrk, pSync3);
+        double avg_time = total_time / npes;
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
-        bandwidth = (npes * (k * sizeof(uint64_t)) * (NR_ITER - SKIP)) / (total_time);
+        bandwidth = (npes * (k * sizeof(uint64_t)) * (NR_ITER - SKIP)) / avg_time;
         src_buff = bandwidth;
         shmem_barrier_all();
         shmem_double_sum_to_all(&dest_buff, &src_buff, 1, 0, 0, npes, pWrk, pSync3); 
@@ -122,7 +131,7 @@ int main(int argc, char ** argv)
             printf("%15.2f", bandwidth / (1024 * 1024));
             printf("%13.2f", agg_bandwidth / (1024 * 1024));
             printf("%13.2f", total_bw);
-            printf("%13.2f", (total_time * 1e6) / ((NR_ITER - SKIP)));
+            printf("%13.2f", (avg_time * 1e6) / ((NR_ITER - SKIP)));
             printf("%13.2f", min_latency * 1e6);
             printf("%13.2f\n", max_latency * 1e6);
         }

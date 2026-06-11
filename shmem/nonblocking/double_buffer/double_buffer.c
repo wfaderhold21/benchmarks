@@ -21,6 +21,10 @@ static double get_time() {
     return retval;
 }
 
+static double get_time_seconds() {
+    return get_time() * 1e-6;
+}
+
 void
 compute_on_host_()
 {
@@ -52,15 +56,18 @@ int main(int argc, char **argv) {
     int64_t *even_src, *even_dst;
     size_t nelems;
     int iterations;
-    shmem_req_h odd_req, even_req;
+    static long odd_ctr, even_ctr;
     double start_time, end_time;
     double comm_time1, comm_time2;
     double total_comm_time = 0.0;
     double compute_time;
-    double latency, latency_avg;
+    static double latency, latency_avg;
+    static double total_time, avg_time;
     int i;
     static long pSync_a2a_odd[SHMEM_ALLTOALL_SYNC_SIZE];
     static long pSync_a2a_even[SHMEM_ALLTOALL_SYNC_SIZE];
+    static long pSync_reduce[SHMEM_REDUCE_SYNC_SIZE];
+    static double pWrk_reduce[SHMEM_REDUCE_MIN_WRKDATA_SIZE];
 
     // Initialize OpenSHMEM
     shmem_init();
@@ -82,10 +89,10 @@ int main(int argc, char **argv) {
     }
 
     // Allocate buffers
-    odd_src = (int64_t *)shmem_malloc(nelems * sizeof(int64_t));
-    odd_dst = (int64_t *)shmem_malloc(nelems * sizeof(int64_t));
-    even_src = (int64_t *)shmem_malloc(nelems * sizeof(int64_t));
-    even_dst = (int64_t *)shmem_malloc(nelems * sizeof(int64_t));
+    odd_src = (int64_t *)shmem_malloc(nelems * n_pes * sizeof(int64_t));
+    odd_dst = (int64_t *)shmem_malloc(nelems * n_pes * sizeof(int64_t));
+    even_src = (int64_t *)shmem_malloc(nelems * n_pes * sizeof(int64_t));
+    even_dst = (int64_t *)shmem_malloc(nelems * n_pes * sizeof(int64_t));
 
     if (!odd_src || !odd_dst || !even_src || !even_dst) {
         fprintf(stderr, "Failed to allocate memory\n");
@@ -94,15 +101,18 @@ int main(int argc, char **argv) {
     }
 
     // Initialize source buffers with some data
-    for (i = 0; i < nelems; i++) {
-        odd_src[i] = my_pe * 1000 + i;
-        even_src[i] = my_pe * 2000 + i;
+    for (size_t idx = 0; idx < nelems * (size_t)n_pes; idx++) {
+        odd_src[idx] = my_pe * 1000 + (int64_t)idx;
+        even_src[idx] = my_pe * 2000 + (int64_t)idx;
     }
-    odd_req = SHMEM_REQ_INVALID;
-    even_req = SHMEM_REQ_INVALID;
+    odd_ctr = 0;
+    even_ctr = 0;
     for (int i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
         pSync_a2a_even[i] = SHMEM_SYNC_VALUE;
         pSync_a2a_odd[i] = SHMEM_SYNC_VALUE;
+    }
+    for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
+        pSync_reduce[i] = SHMEM_SYNC_VALUE;
     }
 
     // Synchronize all PEs before starting the benchmark
@@ -113,29 +123,31 @@ int main(int argc, char **argv) {
         shmem_barrier_all();
     }
     shmem_barrier_all();
-    start_time = MPI_Wtime();
+    start_time = get_time_seconds();
     for (int i = 0; i < iterations; i++) {
         shmem_alltoall64(even_dst, even_src, nelems, 0, 0, n_pes, pSync_a2a_even);
         shmem_barrier_all();
     }
-    end_time = MPI_Wtime();
+    end_time = get_time_seconds();
     latency = end_time - start_time;
-    MPI_Allreduce(&latency, &latency_avg, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    shmem_double_sum_to_all(&latency_avg, &latency, 1, 0, 0, n_pes,
+                            pWrk_reduce, pSync_reduce);
     latency_avg = latency_avg / n_pes;
+    shmem_barrier_all();
     compute_time = 1500; //(0.9 * (latency_avg * 1e6));
     
     // Start timing
-    start_time = MPI_Wtime();
+    start_time = get_time_seconds();
 
     #ifdef WITH_BLOCKING
-        comm_time1 = MPI_Wtime();
+        comm_time1 = get_time_seconds();
         shmem_alltoall64(even_dst, even_src, nelems, 0, 0, n_pes, pSync_a2a_even);
-        comm_time2 = MPI_Wtime();
+        comm_time2 = get_time_seconds();
         total_comm_time += comm_time2 - comm_time1;
     #else
-        comm_time1 = MPI_Wtime();
-        shmemx_alltoallmem_nb(SHMEM_TEAM_WORLD, even_dst, even_src, nelems * sizeof(int64_t), &even_req);
-        comm_time2 = MPI_Wtime();
+        comm_time1 = get_time_seconds();
+        shmemx_alltoall_global_nb(even_dst, even_src, nelems * sizeof(int64_t), &even_ctr);
+        comm_time2 = get_time_seconds();
         total_comm_time += comm_time2 - comm_time1;
 
     #endif
@@ -144,36 +156,38 @@ int main(int argc, char **argv) {
     // Main benchmark loop
     for (i = 1; i < iterations; i++) {
     #ifdef WITH_BLOCKING
-        comm_time1 = MPI_Wtime();
+        comm_time1 = get_time_seconds();
         shmem_barrier_all();
-        comm_time2 = MPI_Wtime();
+        comm_time2 = get_time_seconds();
         total_comm_time += comm_time2 - comm_time1;
 
-        comm_time1 = MPI_Wtime();
+        comm_time1 = get_time_seconds();
         if (i & 1) {
             shmem_alltoall64(odd_dst, odd_src, nelems, 0, 0, n_pes, pSync_a2a_odd);
         } else {
             shmem_alltoall64(even_dst, even_src, nelems, 0, 0, n_pes, pSync_a2a_even);
         }
-        comm_time2 = MPI_Wtime();
+        comm_time2 = get_time_seconds();
         total_comm_time += comm_time2 - comm_time1;
     #else
-        comm_time1 = MPI_Wtime();
-        if (i & 1) { //odd_req != SHMEM_REQ_INVALID) {
-            shmem_req_wait(&even_req);
-        } else { //even_req != SHMEM_REQ_INVALID) {
-            shmem_req_wait(&odd_req);
+        comm_time1 = get_time_seconds();
+        if (i & 1) {
+            shmem_long_wait(&even_ctr, 0);
+            even_ctr = 0;
+        } else {
+            shmem_long_wait(&odd_ctr, 0);
+            odd_ctr = 0;
         }
 
         #ifndef WITHOUT_SYNC
         shmem_sync_all();
         #endif
         if (i & 1) {
-            shmemx_alltoallmem_nb(SHMEM_TEAM_WORLD, odd_dst, odd_src, nelems * sizeof(int64_t), &odd_req);
+            shmemx_alltoall_global_nb(odd_dst, odd_src, nelems * sizeof(int64_t), &odd_ctr);
         } else {
-            shmemx_alltoallmem_nb(SHMEM_TEAM_WORLD, even_dst, even_src, nelems * sizeof(int64_t), &even_req);
+            shmemx_alltoall_global_nb(even_dst, even_src, nelems * sizeof(int64_t), &even_ctr);
         }
-        comm_time2 = MPI_Wtime();
+        comm_time2 = get_time_seconds();
         total_comm_time += comm_time2 - comm_time1;
 
     #endif
@@ -182,30 +196,34 @@ int main(int argc, char **argv) {
         do_compute_cpu_(compute_time);
     }
 #ifdef WITH_BLOCKING
-    comm_time1 = MPI_Wtime();
+    comm_time1 = get_time_seconds();
     shmem_barrier_all();
-    comm_time2 = MPI_Wtime();
+    comm_time2 = get_time_seconds();
     total_comm_time += comm_time2 - comm_time1;
 #else
-    comm_time1 = MPI_Wtime();
-    if (odd_req != SHMEM_REQ_INVALID)
-        shmem_req_wait(&odd_req);
-    if (even_req != SHMEM_REQ_INVALID)
-        shmem_req_wait(&even_req);
+    comm_time1 = get_time_seconds();
+    if (odd_ctr != 0) {
+        shmem_long_wait(&odd_ctr, 0);
+        odd_ctr = 0;
+    }
+    if (even_ctr != 0) {
+        shmem_long_wait(&even_ctr, 0);
+        even_ctr = 0;
+    }
     #ifndef WITHOUT_SYNC
         shmem_sync_all();
     #endif
-    comm_time2 = MPI_Wtime();
+    comm_time2 = get_time_seconds();
     total_comm_time += comm_time2 - comm_time1;
 #endif
 
     // End timing
-    end_time = MPI_Wtime();
     shmem_barrier_all();
+    end_time = get_time_seconds();
 
-    double total_time = end_time - start_time;
-    double avg_time;
-    MPI_Allreduce(&total_time, &avg_time, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    total_time = end_time - start_time;
+    shmem_double_sum_to_all(&avg_time, &total_time, 1, 0, 0, n_pes,
+                            pWrk_reduce, pSync_reduce);
     avg_time = avg_time / n_pes;
 
     // Print results
@@ -219,7 +237,7 @@ int main(int argc, char **argv) {
         printf("Total comm time: %f seconds\n", total_comm_time);
         printf("Average comm time per iter: %f us\n", 1e6 * (total_comm_time / iterations));
         printf("Average time per iteration: %f us\n", 
-               ((end_time - start_time) / iterations) * 1e6);
+               (avg_time / iterations) * 1e6);
     }
 
     shmem_finalize();

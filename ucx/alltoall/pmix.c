@@ -17,31 +17,41 @@ int pmix_data_exchange(uint64_t remote, void *** pack_param)
     void ** pack = NULL;
     ucp_mem_h * mem = (ucp_mem_h *) register_buffer;
     size_t pack_size;
+    void *local_pack = NULL;
     pmix_value_t val;    
     int rc;
     int i = 0;
     ucs_status_t status;
 
-    pack = (void **) malloc(sizeof(void *) * size);
+    pack = (void **) calloc(size, sizeof(void *));
     if (NULL == pack) {
         return ERR_NO_MEMORY;
     }
 
-    status = ucp_rkey_pack(ucp_context, *mem, &pack[my_pe], 
-                           &pack_size);
+    status = ucp_rkey_pack(ucp_context, *mem, &local_pack, &pack_size);
     if (status != UCS_OK) {
         free(pack);
         return status;
     }
 
     // allocate/exchange our own info
-    ex = (struct data_exchange *) malloc(sizeof(struct data_exchange));
+    ex = (struct data_exchange *) malloc(sizeof(struct data_exchange) + pack_size);
     ex->remote = remote;
     ex->pack_size = pack_size;
-    memcpy(ex->pack, &pack[my_pe], pack_size);
+    memcpy(ex->pack, local_pack, pack_size);
+    remote_addresses[my_pe] = remote;
+    pack[my_pe] = malloc(pack_size);
+    if (NULL == pack[my_pe]) {
+        ucp_rkey_buffer_release(local_pack);
+        free(pack);
+        free(ex);
+        return ERR_NO_MEMORY;
+    }
+    memcpy(pack[my_pe], local_pack, pack_size);
+    ucp_rkey_buffer_release(local_pack);
 
     val.type = PMIX_BYTE_OBJECT;
-    val.data.bo.size = sizeof(struct data_exchange);
+    val.data.bo.size = sizeof(struct data_exchange) + pack_size;
     val.data.bo.bytes = (void *) ex;
 
     rc = PMIx_Put(PMIX_GLOBAL, "data_exchange", &val);
@@ -60,7 +70,7 @@ int pmix_data_exchange(uint64_t remote, void *** pack_param)
     for (; i < size; i++) {
         if (i != my_pe) {
             pmix_proc_t proc;
-            pmix_value_t * value = &val;
+            pmix_value_t * value = NULL;
             struct data_exchange * rx;
 
             proc = myproc;
@@ -77,6 +87,7 @@ int pmix_data_exchange(uint64_t remote, void *** pack_param)
             remote_addresses[i] = rx->remote;
             pack[i] = malloc(rx->pack_size);
             memcpy(pack[i], rx->pack, rx->pack_size);
+            PMIX_VALUE_RELEASE(value);
         }
     }
 
@@ -96,7 +107,7 @@ int pmix_worker_exchange(void *** param_worker_addrs)
     int i = 0;
 
     // allocate/exchange our own info
-    worker_addresses = (void **) malloc(sizeof(void *) * size);
+    worker_addresses = (void **) calloc(size, sizeof(void *));
     if (NULL == worker_addresses) {
         return ERR_NO_MEMORY;
     }
@@ -109,12 +120,21 @@ int pmix_worker_exchange(void *** param_worker_addrs)
         return -1;
     }
 
-    ex = (struct worker_exchange *) malloc(sizeof(struct worker_exchange));
+    ex = (struct worker_exchange *) malloc(sizeof(struct worker_exchange) + worker_len);
     ex->worker_len = worker_len;
-    memcpy(&ex->worker, worker_address, worker_len);
+    memcpy(ex->worker, worker_address, worker_len);
+    worker_addresses[my_pe] = malloc(worker_len);
+    if (NULL == worker_addresses[my_pe]) {
+        free(worker_addresses);
+        free(ex);
+        ucp_worker_release_address(ucp_worker, (ucp_address_t *)worker_address);
+        return ERR_NO_MEMORY;
+    }
+    memcpy(worker_addresses[my_pe], worker_address, worker_len);
+    ucp_worker_release_address(ucp_worker, (ucp_address_t *)worker_address);
 
     val.type = PMIX_BYTE_OBJECT;
-    val.data.bo.size = sizeof(struct worker_exchange);
+    val.data.bo.size = sizeof(struct worker_exchange) + worker_len;
     val.data.bo.bytes = (void *) ex;
 
     rc = PMIx_Put(PMIX_GLOBAL, "worker_exchange", &val);
@@ -133,7 +153,7 @@ int pmix_worker_exchange(void *** param_worker_addrs)
     for (; i < size; i++) {
         if (i != my_pe) {
             pmix_proc_t proc;
-            pmix_value_t * value = &val;
+            pmix_value_t * value = NULL;
             struct worker_exchange * rx;
 
             proc = myproc;
@@ -149,6 +169,7 @@ int pmix_worker_exchange(void *** param_worker_addrs)
 //            printf("[%d] PE %d remote address: 0x%lx and buffer length %lu\n", my_pe, i, rx->remote, rx->length);
             worker_addresses[i] = malloc(rx->worker_len);
             memcpy(worker_addresses[i], rx->worker, rx->worker_len);
+            PMIX_VALUE_RELEASE(value);
         }
     }
 

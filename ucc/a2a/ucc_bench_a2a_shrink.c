@@ -44,6 +44,29 @@ static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
 static ucc_status_t oob_allgather_test(void *req) { return UCC_OK; }
 static ucc_status_t oob_allgather_free(void *req) { return UCC_OK; }
 
+static size_t get_ucc_work_buffer_size(ucc_context_h ctx)
+{
+    ucc_context_attr_t attr;
+
+    attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ctx, &attr) ||
+        attr.global_work_buffer_size == 0) {
+        return 5 * sizeof(long);
+    }
+    return attr.global_work_buffer_size;
+}
+
+static void *alloc_zeroed_aligned(size_t size)
+{
+    void *ptr = NULL;
+
+    if (posix_memalign(&ptr, 4096, size) != 0) {
+        return NULL;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
 static void print_header(void)
 {
     printf("%-10s%-12s%15s%15s%15s%14s%14s%14s%14s\n",
@@ -74,7 +97,8 @@ static int run_a2a_phase(int me, int npes, int start_k, int end_k,
             ucc_coll_args_t args = {
                 .mask               = UCC_COLL_ARGS_FIELD_FLAGS |
                                       UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
-                .flags              = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
+                .flags              = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS |
+                                      UCC_COLL_ARGS_FLAG_IN_PLACE,
                 .coll_type          = UCC_COLL_TYPE_ALLTOALL,
                 .src.info           = {
                     .buffer   = (void *)source,
@@ -91,14 +115,15 @@ static int run_a2a_phase(int me, int npes, int start_k, int end_k,
                 .global_work_buffer = pSync,
             };
 
-            MPI_Barrier(comm);
-            double t0 = MPI_Wtime();
-
             ucc_coll_req_h req = NULL;
             if (UCC_OK != ucc_collective_init(&args, &req, team)) {
                 fprintf(stderr, "[rank %d] coll init failed\n", me);
                 return -1;
             }
+
+            MPI_Barrier(comm);
+            double t0 = MPI_Wtime();
+
             if (UCC_OK != ucc_collective_post(req)) {
                 fprintf(stderr, "[rank %d] coll post failed\n", me);
                 return -1;
@@ -112,8 +137,8 @@ static int run_a2a_phase(int me, int npes, int start_k, int end_k,
             }
             ucc_collective_finalize(req);
 
-            double t1 = MPI_Wtime();
             MPI_Barrier(comm);
+            double t1 = MPI_Wtime();
 
             if (i >= SKIP) {
                 double t = t1 - t0;
@@ -140,7 +165,8 @@ static int run_a2a_phase(int me, int npes, int start_k, int end_k,
         MPI_Allreduce(&ldev_sq, &gdev_sq, 1, MPI_DOUBLE, MPI_SUM, comm);
         double var_us2 = (gdev_sq / n) * 1e12;
 
-        double bw = (double)(npes * k * (int)sizeof(int64_t)) * (double)iter / total;
+        double avg_total = gtotal / npes;
+        double bw = (double)(npes * k * (int)sizeof(int64_t)) * (double)iter / avg_total;
         double agg_bw;
         MPI_Allreduce(&bw, &agg_bw, 1, MPI_DOUBLE, MPI_SUM, comm);
         double max_bw = (double)(npes * k * (int)sizeof(int64_t)) /
@@ -154,7 +180,7 @@ static int run_a2a_phase(int me, int npes, int start_k, int end_k,
                    bw / (1024.0 * 1024.0) * ppn,
                    agg_bw / (1024.0 * 1024.0),
                    max_bw * ppn,
-                   gtotal / npes / (double)iter * 1e6,
+                   avg_total / (double)iter * 1e6,
                    gmin * 1e6,
                    gmax * 1e6,
                    var_us2);
@@ -217,16 +243,11 @@ int main(int argc, char **argv)
     }
     int64_t *dest = source; /* in-place alltoall */
 
-    long *pSync;
-    if (posix_memalign((void **)&pSync, 4096, 5 * sizeof(long)) != 0) {
-        fprintf(stderr, "[rank %d] OOM: pSync\n", me);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    memset(pSync, 0, 5 * sizeof(long));
+    long *pSync = NULL;
+    size_t work_buffer_size = 0;
 
-    ucc_mem_map_t maps[2] = {
+    ucc_mem_map_t maps[1] = {
         { .address = source, .len = (size_t)npes * count * sizeof(int64_t) },
-        { .address = pSync,  .len = 5 * sizeof(long) },
     };
 
     /* UCC library init */
@@ -257,7 +278,7 @@ int main(int argc, char **argv)
             .n_oob_eps = npes,
             .oob_ep    = me,
         },
-        .mem_params = { .n_segments = 2, .segments = maps },
+        .mem_params = { .n_segments = 1, .segments = maps },
     };
     ucc_context_config_h ctx_config;
     ucc_context_h ucc_context;
@@ -270,6 +291,13 @@ int main(int argc, char **argv)
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     ucc_context_config_release(ctx_config);
+
+    work_buffer_size = get_ucc_work_buffer_size(ucc_context);
+    pSync = (long *)alloc_zeroed_aligned(work_buffer_size);
+    if (NULL == pSync) {
+        fprintf(stderr, "[rank %d] OOM: UCC work buffer\n", me);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
     /* UCC team over MPI_COMM_WORLD */
     ucc_team_params_t team_params = {
@@ -411,7 +439,7 @@ int main(int argc, char **argv)
             .n_oob_eps = new_npes,
             .oob_ep    = new_me,
         },
-        .mem_params = { .n_segments = 2, .segments = maps },
+        .mem_params = { .n_segments = 1, .segments = maps },
     };
     ucc_context_config_h new_ctx_config;
     ucc_context_h new_ctx;
@@ -426,6 +454,17 @@ int main(int argc, char **argv)
     }
     ucc_context_config_release(new_ctx_config);
     double t1_shrink = MPI_Wtime();
+
+    size_t new_work_buffer_size = get_ucc_work_buffer_size(new_ctx);
+    if (new_work_buffer_size > work_buffer_size) {
+        free(pSync);
+        pSync = (long *)alloc_zeroed_aligned(new_work_buffer_size);
+        if (NULL == pSync) {
+            fprintf(stderr, "[rank %d] OOM: shrunken UCC work buffer\n", new_me);
+            MPI_Abort(new_comm, 1);
+        }
+        work_buffer_size = new_work_buffer_size;
+    }
 
     /* Step 8: create new UCC team on the shrunken context */
     double t0_tc = MPI_Wtime();

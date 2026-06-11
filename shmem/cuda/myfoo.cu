@@ -5,9 +5,8 @@
 
 #include <time.h>
 
-//#include <common.h>
-#define M 10
-#define NR_BLOCK 1024
+#include "common.h"
+#define NR_BLOCK nr_blocks
 
 __global__ void compute(const float * a, float * b)
 {
@@ -86,4 +85,3 @@ void foo(params_t * param)
     compute<<<NR_BLOCK, 1>>>(param->c_a, param->c_b);
     cudaMemcpy(param->b[j], param->c_b, M * sizeof(float), cudaMemcpyDeviceToHost);
 }
-

@@ -98,7 +98,7 @@ int reg_buffer(void * buffer, size_t length)
             goto fail_full;
         }
 
-        ucp_rkey_buffer_release(pack[i]); 
+        free(pack[i]);
         pack[i] = NULL;
     }
 
@@ -267,7 +267,9 @@ int comm_finalize()
 
 int cmpfunc(const void * a, const void * b) 
 {
-    return ((*(double *)a) - (*(double *)b));
+    double aa = *(const double *)a;
+    double bb = *(const double *)b;
+    return (aa > bb) - (aa < bb);
 }
 
 void alltoall_benchmark(char * sdata, int iter, int skip, size_t data_size)
@@ -305,8 +307,12 @@ void alltoall_benchmark(char * sdata, int iter, int skip, size_t data_size)
                         remote_addresses[pe] + remote_offset,
                         rkeys[pe],
                         &req_param);
+            if (UCS_PTR_IS_ERR(ptrs[pe])) {
+                fprintf(stderr, "ucp_put_nbx failed for peer %d: %s\n",
+                        pe, ucs_status_string(UCS_PTR_STATUS(ptrs[pe])));
+                abort();
+            }
         }
-        barrier();
          
         /* Flush all put operations to ensure completion */
         ucs_status_ptr_t flush_req = ucp_worker_flush_nbx(ucp_worker, &req_param);
@@ -323,7 +329,7 @@ void alltoall_benchmark(char * sdata, int iter, int skip, size_t data_size)
         
         end = MPI_Wtime();
         for (int pe = 0; pe < size; pe++) {
-            if (ptrs[pe]) {
+            if (ptrs[pe] && !UCS_PTR_IS_ERR(ptrs[pe])) {
                 ucp_request_free(ptrs[pe]);
             }
         }

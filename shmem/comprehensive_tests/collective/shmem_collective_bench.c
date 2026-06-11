@@ -7,6 +7,7 @@
 static long pSync[SHMEM_ALLTOALL_SYNC_SIZE];
 static long pSync_collect[SHMEM_COLLECT_SYNC_SIZE];
 static long pSync_reduce[SHMEM_REDUCE_SYNC_SIZE];
+static long pSync_bcast[SHMEM_BCAST_SYNC_SIZE];
 
 static void init_sync_arrays() {
     for (int i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
@@ -17,6 +18,9 @@ static void init_sync_arrays() {
     }
     for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
         pSync_reduce[i] = SHMEM_SYNC_VALUE;
+    }
+    for (int i = 0; i < SHMEM_BCAST_SYNC_SIZE; i++) {
+        pSync_bcast[i] = SHMEM_SYNC_VALUE;
     }
 }
 
@@ -234,9 +238,10 @@ static void benchmark_broadcast(const test_config_t* config) {
         size_t buffer_size = nelems * sizeof(long);
         int iterations = calculate_iterations(buffer_size, config->iterations / 10);
         
-        long* buffer = (long*)shmem_malloc_aligned(buffer_size);
+        long* source = (long*)shmem_malloc_aligned(buffer_size);
+        long* dest = (long*)shmem_malloc_aligned(buffer_size);
         
-        if (!buffer) {
+        if (!source || !dest) {
             fprintf(stderr, "Memory allocation failed\n");
             shmem_global_exit(1);
         }
@@ -244,24 +249,25 @@ static void benchmark_broadcast(const test_config_t* config) {
         /* Initialize data on root */
         if (my_pe == 0) {
             for (size_t i = 0; i < nelems; i++) {
-                buffer[i] = 12345 + i;
+                source[i] = 12345 + i;
             }
         } else {
-            memset(buffer, 0, buffer_size);
+            memset(source, 0, buffer_size);
         }
+        memset(dest, 0, buffer_size);
         
         shmem_barrier_all();
         
         /* Warmup */
         for (int i = 0; i < config->warmup / 10; i++) {
-            shmem_broadcast64(buffer, buffer, nelems, 0, 0, 0, n_pes, pSync_reduce);
+            shmem_broadcast64(dest, source, nelems, 0, 0, 0, n_pes, pSync_bcast);
         }
         shmem_barrier_all();
         
         /* Benchmark */
         double start_time = TIME();
         for (int i = 0; i < iterations; i++) {
-            shmem_broadcast64(buffer, buffer, nelems, 0, 0, 0, n_pes, pSync_reduce);
+            shmem_broadcast64(dest, source, nelems, 0, 0, 0, n_pes, pSync_bcast);
         }
         double end_time = TIME();
         
@@ -276,7 +282,7 @@ static void benchmark_broadcast(const test_config_t* config) {
         if (config->validate) {
             int valid = 1;
             for (size_t i = 0; i < nelems && valid; i++) {
-                if (buffer[i] != (long)(12345 + i)) {
+                if (dest[i] != (long)(12345 + i)) {
                     valid = 0;
                 }
             }
@@ -292,7 +298,8 @@ static void benchmark_broadcast(const test_config_t* config) {
                    size_str, latency_us, bandwidth_mbps, iterations);
         }
         
-        shmem_free(buffer);
+        shmem_free(source);
+        shmem_free(dest);
     }
 }
 
@@ -453,4 +460,4 @@ int main(int argc, char* argv[]) {
     
     shmem_finalize();
     return 0;
-} 
+}

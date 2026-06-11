@@ -1,8 +1,11 @@
 # Makefile for UCC Context/Team Creation Benchmark
 
 CC = mpicc
-CFLAGS = -Wall -O2 -g -I/work/nvidia/install.ucc-test/include
-LDFLAGS = -L/work/nvidia/install.ucc-test/lib -lucc -lucs -lopen-pal -lm
+HPCX = /work/nvidia/hpcx-v2.22-gcc-doca_ofed-ubuntu24.04-cuda12-x86_64
+UCC_DIR = $(HPCX)/ucc
+UCX_DIR = $(HPCX)/ucx
+CFLAGS = -Wall -O2 -g -I$(UCC_DIR)/include
+LDFLAGS = -L$(UCX_DIR)/lib -L$(UCC_DIR)/lib -lucc -lucs -lm
 
 TARGET = time-ucc
 SRC = time-ucc.c

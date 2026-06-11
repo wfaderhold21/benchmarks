@@ -407,16 +407,20 @@ int main(int argc, char ** argv)
     
     for (int i = 0; i < NR_ITER; i++) {
         if (i >= SKIP) { 
+            MPI_Barrier(MPI_COMM_WORLD);
             start = MPI_Wtime();
             if (UCC_OK != ucc_context_create(ucc_lib, &ctx_params, ctx_config, &ucc_context[i])) {
                 printf("error on ctx create\n");
                 return -1;
             }
             end = MPI_Wtime();
-            ctx_times[ctx_time_count++] = end - start;
+            double local_elapsed = end - start;
+            double global_elapsed;
+            MPI_Allreduce(&local_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            ctx_times[ctx_time_count++] = global_elapsed;
             MPI_Barrier(MPI_COMM_WORLD);
             if (me == 0) {
-                printf("  Iteration %2d: %6.2f ms\n", i, (end - start) * 1000);
+                printf("  Iteration %2d: %6.2f ms\n", i, global_elapsed * 1000);
             }
 //            ucc_context_destroy(ucc_context[i]);
             MPI_Barrier(MPI_COMM_WORLD);
@@ -447,6 +451,7 @@ int main(int argc, char ** argv)
     
     for (int i = 0; i < NR_ITER; i++) {
         if (i >= SKIP) {
+            MPI_Barrier(MPI_COMM_WORLD);
             start = MPI_Wtime();
             if (UCC_OK != ucc_team_create_post(&ucc_context[NR_ITER], 1, &team_params, &ucc_team[i])) {
                 printf("team create post failed\n");
@@ -455,6 +460,7 @@ int main(int argc, char ** argv)
             
             status = ucc_team_create_test(ucc_team[i]);
             while (UCC_INPROGRESS == status) {
+                ucc_context_progress(ucc_context[NR_ITER]);
                 status = ucc_team_create_test(ucc_team[i]);
             }
             if (UCC_OK != status) {
@@ -462,10 +468,13 @@ int main(int argc, char ** argv)
                 return -1; 
             }
             end = MPI_Wtime();
-            team_times[team_time_count++] = end - start;
+            double local_elapsed = end - start;
+            double global_elapsed;
+            MPI_Allreduce(&local_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            team_times[team_time_count++] = global_elapsed;
             MPI_Barrier(MPI_COMM_WORLD);
             if (me == 0) {
-                printf("  Iteration %2d: %6.2f ms\n", i, (end - start) * 1000);
+                printf("  Iteration %2d: %6.2f ms\n", i, global_elapsed * 1000);
             }
 
         }

@@ -24,12 +24,12 @@ int main(int argc, char **argv) {
     size_t nelems;
     int iterations;
 #ifndef WITH_BLOCKING
-    shmem_req_h odd_req, even_req;
+    static long pSync_nb[SHMEM_BCAST_SYNC_SIZE];
 #endif
     double start_time, end_time;
     int i;
 #ifdef WITH_BLOCKING
-    long pSync_a2a[_SHMEM_ALLTOALL_SYNC_SIZE];
+    static long pSync_bcast[SHMEM_BCAST_SYNC_SIZE];
 #endif
 
     // Initialize OpenSHMEM
@@ -69,12 +69,12 @@ int main(int argc, char **argv) {
         even_src[i] = my_pe * 2000 + i;
     }
 #ifdef WITH_BLOCKING
-    for (int i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
-        pSync_a2a[i] = SHMEM_SYNC_VALUE;
+    for (int i = 0; i < SHMEM_BCAST_SYNC_SIZE; i++) {
+        pSync_bcast[i] = SHMEM_SYNC_VALUE;
     }
 #else
-    odd_req = SHMEM_REQ_INVALID;
-    even_req = SHMEM_REQ_INVALID;
+    for (int i = 0; i < SHMEM_BCAST_SYNC_SIZE; i++)
+        pSync_nb[i] = SHMEM_SYNC_VALUE;
 #endif
 
     // Synchronize all PEs before starting the benchmark
@@ -84,10 +84,9 @@ int main(int argc, char **argv) {
     start_time = get_time();
 
     #ifdef WITH_BLOCKING
-        shmem_broadcast64(even_dst, even_src, nelems, ROOT, 0, 0, n_pes, pSync_a2a);
+        shmem_broadcast64(even_dst, even_src, nelems, ROOT, 0, 0, n_pes, pSync_bcast);
     #else
-  //      shmemx_broadcastmem_nb(SHMEM_TEAM_WORLD, odd_dst, odd_src, nelems * sizeof(int64_t), ROOT, &odd_req);
-        shmemx_broadcastmem_nb(SHMEM_TEAM_WORLD, even_dst, even_src, nelems * sizeof(int64_t), ROOT, &even_req);
+        shmem_broadcast64(even_dst, even_src, nelems, ROOT, 0, 0, n_pes, pSync_nb);
     #endif
 
     // do compute 
@@ -98,23 +97,18 @@ int main(int argc, char **argv) {
     for (i = 1; i < iterations; i++) {
             #ifdef WITH_BLOCKING
                 if (i & 1) {
-                    shmem_broadcast64(odd_dst, odd_src, nelems, ROOT, 0, 0, n_pes, pSync_a2a);
+                    shmem_broadcast64(odd_dst, odd_src, nelems, ROOT, 0, 0, n_pes, pSync_bcast);
                 } else {
-                    shmem_broadcast64(even_dst, even_src, nelems, ROOT, 0, 0, n_pes, pSync_a2a);
+                    shmem_broadcast64(even_dst, even_src, nelems, ROOT, 0, 0, n_pes, pSync_bcast);
                 }
             #else
+                #ifndef WITHOUT_SYNC
+                shmem_sync_all();
+                #endif
                 if (i & 1) {
-                    shmem_req_wait(&even_req);
-                    #ifndef WITHOUT_SYNC
-                    shmem_sync_all();
-                    #endif
-                    shmemx_broadcastmem_nb(SHMEM_TEAM_WORLD, odd_dst, odd_src, nelems * sizeof(int64_t), ROOT, &odd_req);
+                    shmem_broadcast64(odd_dst, odd_src, nelems, ROOT, 0, 0, n_pes, pSync_nb);
                 } else {
-                    shmem_req_wait(&odd_req);
-                    #ifndef WITHOUT_SYNC
-                    shmem_sync_all();
-                    #endif
-                    shmemx_broadcastmem_nb(SHMEM_TEAM_WORLD, even_dst, even_src, nelems * sizeof(int64_t), ROOT, &even_req);
+                    shmem_broadcast64(even_dst, even_src, nelems, ROOT, 0, 0, n_pes, pSync_nb);
                 }
 /*
                 if (odd_req != SHMEM_REQ_INVALID) {
@@ -134,10 +128,6 @@ int main(int argc, char **argv) {
 
             // swap buffers
     }
-#ifndef WITH_BLOCKING
-    shmem_req_wait(&odd_req);
-    shmem_req_wait(&even_req);
-#endif
 
     // End timing
     end_time = get_time();

@@ -363,13 +363,15 @@ int main(int argc, char** argv) {
     memset(pred, 0, nlocalverts * sizeof(int64_t));
 
     /* Do the actual BFS. */
-//    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
     double bfs_start = MPI_Wtime();
     //FIXME: THIS IS THE ACTUAL CALL
     run_bfs(root, &pred[0]);
+    MPI_Barrier(MPI_COMM_WORLD);
     double bfs_stop = MPI_Wtime();
-//    MPI_Barrier(MPI_COMM_WORLD);
-    bfs_times[bfs_root_idx] = bfs_stop - bfs_start;
+    double local_bfs_time = bfs_stop - bfs_start;
+    MPI_Allreduce(&local_bfs_time, &bfs_times[bfs_root_idx], 1, MPI_DOUBLE,
+                  MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) fprintf(stderr, "Time for BFS %d is %f\n", bfs_root_idx, bfs_times[bfs_root_idx]);
 
     /* Validate result. */

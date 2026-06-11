@@ -44,6 +44,7 @@ typedef struct bench_desc {
    char*  pSync_buf;
    int    use_xgvmi; /* use xgvmi in offload */
    int    ppw; /* processes per worker */
+   size_t work_buffer_size;
    double (*run)(struct bench_desc *d, int do_compute, double comp_time,
                  double *init_t, double *comp_t, double *wait_t);
 }bench_desc_t;
@@ -87,7 +88,6 @@ static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
     MPI_Request request;
     MPI_Iallgather(sbuf, msglen, MPI_BYTE, rbuf, msglen, MPI_BYTE, comm,
                    &request);
-    *req = calloc(1, sizeof(ucc_status_t));
     /* FIXME: MPI_Test in oob_allgather_test results in no completion? leave as blocking for now */
     MPI_Wait(&request, MPI_STATUS_IGNORE);
     *req = UCC_OK;
@@ -207,13 +207,28 @@ do_compute_cpu_(double target_usec)
         time_elapsed += (t2-t1);
     }
 }
+
+static void flush_ucc_requests(ucc_coll_req_h *req, int num_ucc_posts,
+                               ucc_context_h context)
+{
+    ucc_status_t status;
+
+    for (int k = 0; k < num_ucc_posts; ++k) {
+        while (UCC_OK != (status = ucc_collective_test(req[k]))) {
+            if (0 > status) {
+                printf("UCC ERROR %s\n", ucc_status_string(status));
+                abort();
+            }
+            ucc_context_progress(context);
+        }
+        ucc_collective_finalize(req[k]);
+    }
+}
                      
 static double run_ucc(bench_desc_t *d, int do_compute, double comp_time, double *init_t, double *comp_t, double *wait_t, int rank, int size, ucc_team_h team, ucc_context_h context)
 {
     int i, j;
     double t_total, comp, init, wait, total;
-    static int round = 0;
-    static int f = 1;
     int num_ucc_posts = 0;
     ucc_coll_req_h req[d->p_d];
     ucc_status_t status;
@@ -257,10 +272,11 @@ static double run_ucc(bench_desc_t *d, int do_compute, double comp_time, double 
 
     *init_t = *comp_t = *wait_t = t_total = 0.0, total = 0.0;
 
+    shmem_barrier_all();
     total = TIME();
     for (i = 0; i < d->loop; i++) {
-        int index = i % 16;
-        coll.global_work_buffer = d->pSync_buf + index * sizeof(long);
+        coll.global_work_buffer = d->pSync_buf +
+                                  (size_t)num_ucc_posts * d->work_buffer_size;
         init = TIME();
         status = ucc_collective_init(&coll, &req[num_ucc_posts], team);
         if (status != UCC_OK) {
@@ -277,27 +293,17 @@ static double run_ucc(bench_desc_t *d, int do_compute, double comp_time, double 
             do_compute_cpu_(comp_time);
             *comp_t += TIME() - comp;
         }
-        if (!(round++ % d->p_d)) {
+        if (num_ucc_posts == d->p_d) {
             wait = TIME();
-            for (int k = 0; k < num_ucc_posts; ++k) {
-                while (UCC_OK != (status = ucc_collective_test(req[k]))) {
-                    if (0 > status) {
-                        printf("UCC ERROR %s\n", ucc_status_string(status));
-                        abort();
-                        return 0.0;
-                    }
-                    ucc_context_progress(context);
-                } 
-                ucc_collective_finalize(req[k]);
-            }
+            flush_ucc_requests(req, num_ucc_posts, context);
             *wait_t += TIME() - wait;
             num_ucc_posts = 0;
-
-            if (!f) {
-                f = 1;
-            }
         }
-        shmem_barrier_all();
+    }
+    if (num_ucc_posts > 0) {
+        wait = TIME();
+        flush_ucc_requests(req, num_ucc_posts, context);
+        *wait_t += TIME() - wait;
     }
     t_total = TIME() - total;
     shmem_barrier_all();
@@ -321,7 +327,7 @@ int setup_ucc(int rank, int size, bench_desc_t *desc,
     ucc_lib_params_t lib_params;
     ucc_context_config_h ctx_config;
     ucc_context_params_t ctx_params = {0};
-    ucc_mem_map_t maps[3] = {0};
+    ucc_mem_map_t maps[1] = {0};
     ucc_status_t status;
 
     /* make ucc here */
@@ -341,8 +347,6 @@ int setup_ucc(int rank, int size, bench_desc_t *desc,
 
     maps[0].address = desc->s_buf;
     maps[0].len = ebuf->len;
-    maps[1].address = desc->pSync_buf;
-    maps[1].len = 16 * sizeof(long);
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
@@ -352,7 +356,7 @@ int setup_ucc(int rank, int size, bench_desc_t *desc,
     ctx_params.oob.n_oob_eps = size;
     ctx_params.oob.oob_ep    = rank;
     ctx_params.mem_params.segments = maps;
-    ctx_params.mem_params.n_segments = 2;
+    ctx_params.mem_params.n_segments = 1;
 
     if (UCC_OK != ucc_context_config_read(ucc_lib, NULL, &ctx_config)) {
         printf("error ucc ctx config read\n");
@@ -366,6 +370,21 @@ int setup_ucc(int rank, int size, bench_desc_t *desc,
     *context = ucc_context;
 
     ucc_context_config_release(ctx_config);
+
+    ucc_context_attr_t ctx_attr;
+    ctx_attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ucc_context, &ctx_attr) ||
+        ctx_attr.global_work_buffer_size == 0) {
+        desc->work_buffer_size = sizeof(long);
+    } else {
+        desc->work_buffer_size = ctx_attr.global_work_buffer_size;
+    }
+    desc->pSync_buf = shmem_calloc(desc->p_d, desc->work_buffer_size);
+    if (NULL == desc->pSync_buf) {
+        printf("failed to allocate UCC work buffers\n");
+        return -1;
+    }
+    shmem_barrier_all();
 
     team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS;
     team_params.oob.allgather = oob_allgather;
@@ -424,6 +443,8 @@ int main(int argc, char *argv[])
     desc.name         = "barrier";
     desc.compute_time = -1;
     desc.use_xgvmi    = 0;
+    desc.pSync_buf    = NULL;
+    desc.work_buffer_size = 0;
     mppw              = 0;
     ppn               = 1;
     is_many_counters  = 0;
@@ -460,6 +481,10 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (desc.p_d < 1) {
+        desc.p_d = 1;
+    }
+
     desc.num_counters = is_many_counters ?  max(desc.p_d, desc.loop) : desc.p_d;
     align_size = 64;
     shmem_barrier_all();
@@ -467,6 +492,11 @@ int main(int argc, char *argv[])
     for (int i = 0; i < SHMEM_ALLTOALL_SYNC_SIZE; i++) {
         pSync_a2a[i] = SHMEM_SYNC_VALUE;
     }
+    for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; i++) {
+        pSyncRed1[i] = SHMEM_SYNC_VALUE;
+        pSyncRed2[i] = SHMEM_SYNC_VALUE;
+    }
+    shmem_barrier_all();
 
 #ifdef OSHM_1_3
     desc.counters   = (int *)shmem_malloc(desc.num_counters*sizeof(int));
@@ -503,7 +533,6 @@ int main(int argc, char *argv[])
 
     desc.s_buf = (char *)send_buf;
     desc.r_buf = (char *)recv_buf;
-    desc.pSync_buf = shmem_calloc(sizeof(long), 16);
 
     for (i = 0; i < length; i++) {
         desc.s_buf[i] = 'a';
@@ -597,4 +626,3 @@ int main(int argc, char *argv[])
 #endif
     return EXIT_SUCCESS;
 }
-

@@ -128,6 +128,29 @@ static ucc_status_t oob_allgather_free(void *req)
     return UCC_OK;
 }
 
+static size_t get_ucc_work_buffer_size(ucc_context_h ctx)
+{
+    ucc_context_attr_t attr;
+
+    attr.mask = UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
+    if (UCC_OK != ucc_context_get_attr(ctx, &attr) ||
+        attr.global_work_buffer_size == 0) {
+        return 5 * sizeof(long);
+    }
+    return attr.global_work_buffer_size;
+}
+
+static void *alloc_zeroed_aligned(size_t size)
+{
+    void *ptr = NULL;
+
+    if (posix_memalign(&ptr, 4096, size) != 0) {
+        return NULL;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
 int main(int argc, char ** argv)
 {
     int me;
@@ -196,17 +219,7 @@ int main(int argc, char ** argv)
     }
     int64_t* dest = source;
 
-    // Allocate synchronization arrays with proper alignment
-    if (posix_memalign((void**)&pSync, 4096, sizeof(long) * 5) != 0) {
-        printf("Failed to allocate aligned memory for pSync\n");
-        return -1;
-    }
-
-    for (int i = 0; i < 5; i++) {
-        pSync[i] = 0;
-    }
-
-    maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t) * 2);
+    maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t));
     if (maps == NULL) {
         printf("OOM\n");
         return -1;
@@ -214,8 +227,6 @@ int main(int argc, char ** argv)
 
     maps[0].address = source;
     maps[0].len = npes * count * sizeof(int64_t);
-    maps[1].address = pSync;
-    maps[1].len = 5 * sizeof(long);
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
@@ -224,7 +235,7 @@ int main(int argc, char ** argv)
     ctx_params.oob.coll_info = (void *)MPI_COMM_WORLD;
     ctx_params.oob.n_oob_eps = npes;
     ctx_params.oob.oob_ep = me;
-    ctx_params.mem_params.n_segments = 2;
+    ctx_params.mem_params.n_segments = 1;
     ctx_params.mem_params.segments = maps;
 
     ucc_lib_params_t lib_params = {
@@ -256,6 +267,13 @@ int main(int argc, char ** argv)
 
     ucc_context_config_release(ctx_config);
 
+    size_t work_buffer_size = get_ucc_work_buffer_size(ucc_context);
+    pSync = (long *)alloc_zeroed_aligned(work_buffer_size);
+    if (NULL == pSync) {
+        printf("Failed to allocate UCC work buffer\n");
+        return -1;
+    }
+
     team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS;
     team_params.oob.allgather = oob_allgather;
     team_params.oob.req_test = oob_allgather_test;
@@ -271,7 +289,9 @@ int main(int argc, char ** argv)
         return -1; 
     }   
 
-    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {}
+    while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {
+        ucc_context_progress(ucc_context);
+    }
     if (UCC_OK != status) {
         printf("team create failed\n");
         return -1; 
@@ -327,7 +347,9 @@ int main(int argc, char ** argv)
             long * a_psync = pSync;
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
-                .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
+                .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS |
+                              UCC_COLL_ARGS_FLAG_IN_PLACE |
+                              UCC_COLL_ARGS_FLAG_PERSISTENT,
                 .coll_type = UCC_COLL_TYPE_ALLTOALL,
                 .src.info =
                     {
@@ -352,16 +374,16 @@ int main(int argc, char ** argv)
                 read_hw_counters(&iter_start_counters, hw_counter_base_path);
             }
 
+            ucc_coll_req_h req = NULL;
+            status = ucc_collective_init(&coll_args, &req, ucc_team);
+            if (status != UCC_OK) {
+                printf("coll init failed\n");
+                return -1;
+            }
+
             MPI_Barrier(MPI_COMM_WORLD);
             start = MPI_Wtime();
-
             for (int z = 0; z < num; z++) {
-                ucc_coll_req_h req = NULL;
-                status = ucc_collective_init(&coll_args, &req, ucc_team);
-                if (status != UCC_OK) {
-                    printf("coll init failed\n");
-                    return -1;
-                }
                 status = ucc_collective_post(req);
                 if (status != UCC_OK) {
                     printf("FAILED TO POST\n");
@@ -374,8 +396,10 @@ int main(int argc, char ** argv)
                     }
                     ucc_context_progress(ucc_context);
                 }
-                ucc_collective_finalize(req);
             }
+            ucc_collective_finalize(req);
+
+            MPI_Barrier(MPI_COMM_WORLD);
             end = MPI_Wtime();
 
             // Stop hardware counter measurement for this iteration
@@ -387,8 +411,6 @@ int main(int argc, char ** argv)
                     total_size_counters.counters[j] += (iter_end_counters.counters[j] - iter_start_counters.counters[j]);
                 }
             }
-
-            MPI_Barrier(MPI_COMM_WORLD);
 
             if (i >= SKIP) {
                 double time = (end - start);
@@ -428,9 +450,9 @@ int main(int argc, char ** argv)
         MPI_Allreduce(&total, &global_total, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         min_latency = global_min;
-        total_time = total;
+        total_time = global_total;
         max_latency = global_max;
-        double n = (double)npes * (iter - SKIP);
+        double n = (double)npes * (double)iter;
         double avg_time = global_total / npes;
         double global_mean = global_total / n;
         /* Combine per-rank Welford M2 with correction for difference between
@@ -442,7 +464,7 @@ int main(int argc, char ** argv)
         double variance_us2 = (global_dev_sq / n) * 1e12;
 
         total_bw = (npes * (k * sizeof(uint64_t))) / (1024 * 1024 * min_latency);
-        bandwidth = (npes * (k * sizeof(uint64_t)) * (iter - SKIP)) / (total_time);
+        bandwidth = (npes * (k * sizeof(uint64_t)) * (double)iter) / avg_time;
         src_buff = bandwidth;
 
         MPI_Allreduce(&src_buff, &agg_bandwidth, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -454,7 +476,7 @@ int main(int argc, char ** argv)
                    (bandwidth / (1024 * 1024)) * ppn,
                    agg_bandwidth / (1024 * 1024),
                    total_bw * ppn,
-                   (avg_time * 1e6) / (iter - SKIP),
+                   (avg_time * 1e6) / (double)iter,
                    min_latency * 1e6,
                    max_latency * 1e6,
                    variance_us2);
@@ -478,4 +500,4 @@ int main(int argc, char ** argv)
     
     MPI_Finalize();
     return 0;
-} 
+}
