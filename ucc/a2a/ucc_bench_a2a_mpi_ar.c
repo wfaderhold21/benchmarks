@@ -13,6 +13,7 @@
  *  motivating case for the congestion-avoidance work.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -20,10 +21,14 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <malloc.h>
 
 #include <ucc/api/ucc.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 #define NR_ITER     100
 #define SKIP        10
@@ -234,6 +239,8 @@ int main(int argc, char ** argv)
     size_t iter = NR_ITER;
     int ppn = 1;
     const char *hw_iface = NULL;
+    const char *csv_path   = NULL;
+    FILE       *csv_fp     = NULL;
     char hw_counter_base_path[256];
     hw_counter_data_t hw_counters_available_check = {0};
     char c;
@@ -242,15 +249,23 @@ int main(int argc, char ** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &world_me);
     MPI_Comm_size(MPI_COMM_WORLD, &world_npes);
 
-    while ((c = getopt(argc, argv, "i:s:d:p:c:")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:c:o:")) != -1) {
         switch (c) {
-            case 's': size = atoi(optarg); break;
-            case 'i': iter = atoi(optarg); break;
-            case 'd': num  = atoi(optarg); break;
-            case 'p': ppn  = atoi(optarg); break;
-            case 'c': hw_iface = optarg; break;
+            case 's': size     = atoi(optarg); break;
+            case 'i': iter     = atoi(optarg); break;
+            case 'd': num      = atoi(optarg); break;
+            case 'p': ppn      = atoi(optarg); break;
+            case 'c': hw_iface = optarg;      break;
+            case 'o': csv_path = optarg;       break;
             default: MPI_Finalize(); return -1;
         }
+    }
+
+    /* CSV output file */
+    if (!csv_path) csv_path = getenv("BENCH_CSV");
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
 
     if (world_npes < 4) {
@@ -345,6 +360,12 @@ int main(int argc, char ** argv)
     }
 
     MPI_Barrier(sub_comm);
+
+    /* CSV metadata */
+    bench_meta_t meta = { "ucc_a2a", "mpi_ar", world_npes, ppn, NULL };
+    char *tls_str = transport_detect();
+    if (tls_str) meta.tls = tls_str;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     if (hw_iface) {
         hw_counters_available_check.hw_counters_available = check_hw_counters_available(hw_counter_base_path);
@@ -504,6 +525,15 @@ int main(int argc, char ** argv)
                        global_counters.counters[3]);
             }
             printf("\n");
+
+            /* CSV row */
+            if (csv_fp) {
+                bench_csv_row(csv_fp, &meta,
+                              k * sizeof(uint64_t), (int)iter,
+                              avg_time * 1e6 / iter, min_latency * 1e6,
+                              max_latency * 1e6, sqrt(variance_us2),
+                              bandwidth / (1024.0 * 1024.0));
+            }
         }
     }
 
@@ -521,6 +551,9 @@ int main(int argc, char ** argv)
     }
     ucc_context_destroy(ucc_context);
     ucc_finalize(lib);
+
+    if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
 
     free(source);
     free(pSync);

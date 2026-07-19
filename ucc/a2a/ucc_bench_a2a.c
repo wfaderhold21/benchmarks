@@ -4,6 +4,7 @@
  *  Meant to be used with OSHMEM
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -15,6 +16,9 @@
 #include <unistd.h>
 
 #include <ucc/api/ucc.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 #define NR_ITER     100
 #define SKIP        10
@@ -185,7 +189,9 @@ int main(int argc, char ** argv)
     int num = 1;
     size_t iter = NR_ITER;
     int ppn = 1;
-    int monitor_hw_counters = 0;  // Flag for hardware counter monitoring
+    int monitor_hw_counters = 0;  /* flag: hardware counter monitoring */
+    const char *csv_path = NULL;
+    FILE       *csv_fp   = NULL;
     hw_counter_data_t hw_counters_available_check = {0};
     char c;
     ucc_context_params_t ctx_params;
@@ -199,30 +205,38 @@ int main(int argc, char ** argv)
     static uint64_t local_count = 0;
     static uint64_t global_count = 0;
 
-    while ((c = getopt(argc, argv, "i:s:d:p:c")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:co:")) != -1) {
         switch (c) {
-            case 's':
-                size = atoi(optarg);
-                break;
-            case 'i':
-                iter = atoi(optarg);
-                break;
-            case 'd':
-                num = atoi(optarg);
-                break;
-            case 'p':
-                ppn = atoi(optarg);
-                break;
-            case 'c':
-                monitor_hw_counters = 1;
-                break;
-            default:
-                return -1;
+            case 's': size           = atoi(optarg); break;
+            case 'i': iter           = atoi(optarg); break;
+            case 'd': num            = atoi(optarg); break;
+            case 'p': ppn            = atoi(optarg); break;
+            case 'c': monitor_hw_counters = 1;        break;
+            case 'o': csv_path       = optarg;        break;
+            default: return -1;
         }
     }
+
+    /* Open CSV output file (CLI override or BENCH_CSV env var) */
+    if (!csv_path) {
+        csv_path = getenv("BENCH_CSV");
+    }
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) {
+            fprintf(stderr, "cannot open CSV file: %s\n", csv_path);
+        }
+    }
+
     shmem_init();
     me = shmem_my_pe();
     npes = shmem_n_pes();
+
+    /* CSV metadata */
+    bench_meta_t meta = { "ucc_a2a", "shmem", npes, ppn, NULL };
+    char *tls_str = transport_detect();
+    if (tls_str) meta.tls = tls_str;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
 #ifndef WITH_MEMH
     int64_t* source = (int64_t *) shmem_malloc(npes * count * sizeof(int64_t));
@@ -526,11 +540,22 @@ int main(int argc, char ** argv)
                 printf("%20lu", global_counters.counters[3]); // ECN Marked
             }
             printf("\n");
+
+            /* CSV row */
+            if (csv_fp) {
+                bench_csv_row(csv_fp, &meta,
+                              k * sizeof(uint64_t), (int)iter,
+                              avg_time * 1e6 / iter, min_latency * 1e6,
+                              max_latency * 1e6, 0.0,
+                              bandwidth / (1024 * 1024));
+            }
         }
     }
 
     shmem_barrier_all();
     shmem_quiet();
+    if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
     shmem_finalize();
     return 0;
 }

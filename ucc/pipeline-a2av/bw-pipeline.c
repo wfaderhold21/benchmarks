@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <shmem.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -10,6 +11,9 @@
 #include <ucc/api/ucc.h>
 #include <ucp/api/ucp.h>
 #include <sched.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 enum {
     FUNC_FAILURE = -1,
@@ -421,6 +425,8 @@ int main(int argc, char *argv[])
     static double comp_total, wait_total, timer, init_total;
     static double latency_avg, latency,  avg_time, max_time, min_time;
     double avg_wt, avg_it, avg_ct, avg_tt;
+    const char *csv_path = NULL;
+    FILE       *csv_fp   = NULL;
     char c;
     int mppw;
     int use_host;
@@ -450,36 +456,32 @@ int main(int argc, char *argv[])
     is_many_counters  = 0;
     use_host = 1;
 
-    while ((c = getopt(argc, argv, "i:s:d:p:w:u:bx")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:w:u:bxo:")) != -1) {
         switch (c) {
-            case 's':
-                desc.msg_size = atoi(optarg);
-                break;
-            case 'i':
-                desc.loop = atoi(optarg);
-                break;
-            case 'd':
-                desc.p_d = atoi(optarg);
-                break;
-            case 'p':
-                ppn = atoi(optarg);
-                break;
-            case 'w':
-                desc.compute_time = atof(optarg);
-                break;
-            case 'x':
-                desc.use_xgvmi = 1;
-                break;
-            case 'u':
-                mppw = atoi(optarg);
-                break;
-            case 'b':
-                use_host = 0;
-                break;
-            default:
-                return -1;
+            case 's': desc.msg_size = atoi(optarg);   break;
+            case 'i': desc.loop     = atoi(optarg);   break;
+            case 'd': desc.p_d      = atoi(optarg);   break;
+            case 'p': ppn           = atoi(optarg);   break;
+            case 'w': desc.compute_time = atof(optarg); break;
+            case 'x': desc.use_xgvmi    = 1;          break;
+            case 'u': mppw           = atoi(optarg);  break;
+            case 'b': use_host       = 0;             break;
+            case 'o': csv_path       = optarg;         break;
+            default: return -1;
         }
     }
+
+    /* CSV output file */
+    if (!csv_path) csv_path = getenv("BENCH_CSV");
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
+    }
+
+    bench_meta_t meta = { "ucc_pipeline_a2av", NULL, numprocs, ppn, NULL };
+    char *tls_str = transport_detect();
+    if (tls_str) meta.tls = tls_str;
+    if (csv_fp && desc.myid == 0) bench_csv_header(csv_fp);
 
     if (desc.p_d < 1) {
         desc.p_d = 1;
@@ -619,7 +621,19 @@ int main(int argc, char *argv[])
                 LOCAL_WIDTH, FLOAT_PRECISION, desc.msg_size*numprocs*ppn/avg_tt);
 
         fflush(stdout);
+
+        /* CSV row */
+        if (csv_fp) {
+            bench_csv_row(csv_fp, &meta,
+                          desc.msg_size, desc.loop,
+                          latency_avg, min_time / desc.loop,
+                          max_time / desc.loop, 0.0,
+                          desc.msg_size * numprocs * ppn / avg_tt);
+        }
     }
+
+    if (csv_fp && desc.myid == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
 
 #ifdef OSHM_1_3
     shmem_finalize();

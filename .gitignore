@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+a.out
+ucc/timing-ucc/time-ucc
+ucc/a2a/ucc_bench_a2a_cuda
+
+# Log files from benchmarks
+shmem/alltoall/results/**/*.log
+__pycache__/

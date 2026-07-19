@@ -4,6 +4,7 @@
  *  Meant to be used with OSHMEM
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -14,6 +15,9 @@
 #include <string.h>
 
 #include <ucc/api/ucc.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 #define NR_ITER     100
 #define SKIP        10
@@ -117,6 +121,8 @@ int main(int argc, char ** argv)
     static double src_buff, dest_buff;
     int size = 1;
     int num = 1;
+    const char *csv_path = NULL;
+    FILE       *csv_fp   = NULL;
     ucc_context_params_t ctx_params;
     ucc_context_config_h ctx_config;
     ucc_context_h ucc_context;
@@ -138,6 +144,18 @@ int main(int argc, char ** argv)
     shmem_init();
     me = shmem_my_pe();
     npes = shmem_n_pes();
+
+    /* CSV output file */
+    csv_path = getenv("BENCH_CSV");
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
+    }
+
+    bench_meta_t meta = { "ucc_a2av", "shmem", npes, 1, NULL };
+    char *tls_str = transport_detect();
+    if (tls_str) meta.tls = tls_str;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     src_count = malloc(sizeof(int64_t) * npes);
     dst_count = malloc(sizeof(int64_t) * npes);
@@ -369,10 +387,20 @@ int main(int argc, char ** argv)
             printf("%13.2f", (avg_time * 1e6) / (double)NR_ITER);
             printf("%13.2f", min_latency * 1e6);
             printf("%13.2f\n", max_latency * 1e6);
+
+            if (csv_fp) {
+                bench_csv_row(csv_fp, &meta,
+                              k * sizeof(uint64_t), NR_ITER,
+                              avg_time * 1e6 / NR_ITER, min_latency * 1e6,
+                              max_latency * 1e6, 0.0,
+                              bandwidth / (1024.0 * 1024.0));
+            }
         }
     }
 
     shmem_barrier_all();
+    if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
     shmem_quiet();
     shmem_finalize();
     return 0;

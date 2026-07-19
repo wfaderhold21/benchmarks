@@ -13,9 +13,11 @@
 #include <limits.h>
 #include <string.h>
 #include <math.h>
-#include <link.h>
 
 #include <ucc/api/ucc.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 #define NR_ITER     10
 #define SKIP        1
@@ -93,6 +95,30 @@ static int find_ucx_tls_callback(struct dl_phdr_info *info, size_t size, void *d
 static void get_loaded_ucx_transports(ucc_tl_list_t *tl_list) {
     tl_list->count = 0;
     dl_iterate_phdr(find_ucx_tls_callback, tl_list);
+}
+
+static void write_csv_timing(const char *bench_name, FILE *csv_fp,
+                              bench_meta_t *meta, double *times, int count)
+{
+    if (!csv_fp || !times || count == 0) return;
+
+    double sum = 0.0, mn = times[0], mx = times[0];
+    for (int i = 0; i < count; i++) {
+        sum += times[i];
+        if (times[i] < mn) mn = times[i];
+        if (times[i] > mx) mx = times[i];
+    }
+    double avg = sum / count;
+    double variance = 0.0;
+    for (int i = 0; i < count; i++) {
+        double diff = times[i] - avg;
+        variance += diff * diff;
+    }
+    variance /= count;
+
+    meta->bench_name = bench_name;
+    bench_csv_row(csv_fp, meta, 0, count,
+                  avg * 1e6, mn * 1e6, mx * 1e6, sqrt(variance), 0.0);
 }
 
 void print_statistics(const char *label, double *times, int count, int rank) {
@@ -315,10 +341,24 @@ int main(int argc, char ** argv)
     ucc_team_params_t team_params;
     ucc_status_t status;
     ucc_lib_h ucc_lib;
+    const char *csv_path = NULL;
+    FILE       *csv_fp   = NULL;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
+
+    /* CSV output file */
+    csv_path = getenv("BENCH_CSV");
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
+    }
+
+    bench_meta_t meta = { NULL, NULL, npes, 1, NULL };
+    char *tls_str = transport_detect();
+    if (tls_str) meta.tls = tls_str;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     // Allocate timing arrays
     ctx_times = (double *) malloc(sizeof(double) * NR_ITER);
@@ -432,6 +472,7 @@ int main(int argc, char ** argv)
     }
 
     print_statistics("Context Creation", ctx_times, ctx_time_count, me);
+    if (me == 0) write_csv_timing("ctx_create", csv_fp, &meta, ctx_times, ctx_time_count);
 
     ucc_context_config_release(ctx_config);
 
@@ -483,7 +524,8 @@ int main(int argc, char ** argv)
     }
     
     print_statistics("Team Creation", team_times, team_time_count, me);
-    
+    if (me == 0) write_csv_timing("team_create", csv_fp, &meta, team_times, team_time_count);
+
     // Print UCC configuration info
     print_ucc_info(ucc_lib, ucc_context[NR_ITER], me);
     
@@ -493,6 +535,9 @@ int main(int argc, char ** argv)
         printf("========================================\n");
     }
     
+    if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
+
     // Cleanup
     free(ctx_times);
     free(team_times);

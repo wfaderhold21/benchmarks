@@ -1,7 +1,6 @@
 /*
- *  This benchmark measures bandwidth and latency for a2a calls in MPI. 
- *
- *  Meant to be used with MPI
+ *  This benchmark measures bandwidth and latency for a2a calls using
+ *  UCC with CUDA device buffers.
  */
 
 #define _GNU_SOURCE
@@ -15,6 +14,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <malloc.h>
+
+#include <cuda_runtime.h>
 
 #include <ucc/api/ucc.h>
 
@@ -86,18 +87,6 @@ int read_hw_counters(hw_counter_data_t* data, const char *base_path) {
     return 1;
 }
 
-void print_hw_counter_diff(const char* prefix, hw_counter_data_t* start, hw_counter_data_t* end) {
-    if (!start->hw_counters_available || !end->hw_counters_available) {
-        return;
-    }
-
-    printf("%s Hardware Counters:\n", prefix);
-    for (int i = 0; i < NUM_HW_COUNTERS; i++) {
-        uint64_t diff = end->counters[i] - start->counters[i];
-        printf("  %s: %lu\n", hw_counter_names[i], diff);
-    }
-}
-
 
 static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
                                    void *coll_info, void **req)
@@ -108,7 +97,6 @@ static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
                    &request);
     *req = (void *)(uintptr_t)request;
 #if 1
-    /* FIXME: MPI_Test in oob_allgather_test results in no completion? leave as blocking for now */
     MPI_Wait(&request, MPI_STATUS_IGNORE);
     *req = UCC_OK;
 #endif
@@ -117,15 +105,7 @@ static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
 
 static ucc_status_t oob_allgather_test(void *req)
 {
-#if 0
-    MPI_Request request = (MPI_Request)(uintptr_t)req;
-    int         completed;
-    MPI_Test(&request, &completed, MPI_STATUS_IGNORE);
-
-    return completed ? UCC_OK : UCC_INPROGRESS;
-#else
     return UCC_OK;
-#endif
 }
 
 static ucc_status_t oob_allgather_free(void *req)
@@ -156,6 +136,14 @@ static void *alloc_zeroed_aligned(size_t size)
     return ptr;
 }
 
+static cudaError_t cuda_or_die(cudaError_t e, const char *msg)
+{
+    if (e != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s (%s)\n", msg, cudaGetErrorString(e));
+    }
+    return e;
+}
+
 int main(int argc, char ** argv)
 {
     int me;
@@ -176,6 +164,7 @@ int main(int argc, char ** argv)
     char hw_counter_base_path[256];
     hw_counter_data_t hw_counters_available_check = {0};
     char c;
+    int use_reg = 0;
     ucc_context_params_t ctx_params;
     ucc_context_config_h ctx_config;
     ucc_context_h ucc_context;
@@ -187,12 +176,11 @@ int main(int argc, char ** argv)
     uint64_t local_count = 0;
     uint64_t global_count = 0;
 
-    // Initialize MPI
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
 
-    while ((c = getopt(argc, argv, "i:s:d:p:c:o:")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:c:o:r")) != -1) {
         switch (c) {
             case 's': size   = atoi(optarg); break;
             case 'i': iter   = atoi(optarg); break;
@@ -200,19 +188,18 @@ int main(int argc, char ** argv)
             case 'p': ppn    = atoi(optarg); break;
             case 'c': hw_iface = optarg;     break;
             case 'o': csv_path = optarg;      break;
+            case 'r': use_reg = 1;           break;
             default: return -1;
         }
     }
 
-    /* CSV output file */
     if (!csv_path) csv_path = getenv("BENCH_CSV");
     if (csv_path) {
         csv_fp = fopen(csv_path, "w");
         if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
 
-    /* CSV metadata */
-    bench_meta_t meta = { "ucc_a2a", "mpi", npes, ppn, NULL };
+    bench_meta_t meta = { "ucc_a2a", use_reg ? "cuda_reg" : "cuda", npes, ppn, NULL };
     char *tls_str = transport_detect();
     if (tls_str) meta.tls = tls_str;
     if (csv_fp && me == 0) bench_csv_header(csv_fp);
@@ -222,12 +209,9 @@ int main(int argc, char ** argv)
                  "/sys/class/infiniband/%s/ports/1/hw_counters/", hw_iface);
     }
 
-    int64_t* source;
-    if (posix_memalign((void**)&source, 4096, npes * count * sizeof(int64_t)) != 0) {
-        printf("Failed to allocate aligned memory for source\n");
-        return -1;
-    }
-    int64_t* dest = source;
+    size_t buf_len = npes * count * sizeof(int64_t);
+    int64_t* d_source;
+    cuda_or_die(cudaMalloc((void **)&d_source, buf_len), "cudaMalloc source");
 
     maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t));
     if (maps == NULL) {
@@ -235,18 +219,18 @@ int main(int argc, char ** argv)
         return -1;
     }
 
-    maps[0].address = source;
-    maps[0].len = npes * count * sizeof(int64_t);
+    maps[0].address = d_source;
+    maps[0].len     = buf_len;
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
-    ctx_params.oob.req_test = oob_allgather_test;
-    ctx_params.oob.req_free = oob_allgather_free;
+    ctx_params.oob.req_test  = oob_allgather_test;
+    ctx_params.oob.req_free  = oob_allgather_free;
     ctx_params.oob.coll_info = (void *)MPI_COMM_WORLD;
     ctx_params.oob.n_oob_eps = npes;
-    ctx_params.oob.oob_ep = me;
+    ctx_params.oob.oob_ep    = me;
     ctx_params.mem_params.n_segments = 1;
-    ctx_params.mem_params.segments = maps;
+    ctx_params.mem_params.segments   = maps;
 
     ucc_lib_params_t lib_params = {
         .mask = UCC_LIB_PARAM_FIELD_THREAD_MODE,
@@ -286,27 +270,41 @@ int main(int argc, char ** argv)
 
     team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS;
     team_params.oob.allgather = oob_allgather;
-    team_params.oob.req_test = oob_allgather_test;
-    team_params.oob.req_free = oob_allgather_free;
+    team_params.oob.req_test  = oob_allgather_test;
+    team_params.oob.req_free  = oob_allgather_free;
     team_params.oob.coll_info = MPI_COMM_WORLD;
     team_params.oob.n_oob_eps = npes;
-    team_params.oob.oob_ep = me;
-    team_params.ep = me;
-    team_params.flags = UCC_TEAM_FLAG_COLL_WORK_BUFFER;
+    team_params.oob.oob_ep    = me;
+    team_params.ep            = me;
+    team_params.flags         = UCC_TEAM_FLAG_COLL_WORK_BUFFER;
 
     if (UCC_OK != ucc_team_create_post(&ucc_context, 1, &team_params, &ucc_team)) {
         printf("team create post failed\n");
-        return -1; 
-    }   
+        return -1;
+    }
 
     while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_team))) {
         ucc_context_progress(ucc_context);
     }
     if (UCC_OK != status) {
         printf("team create failed\n");
-        return -1; 
+        return -1;
     }
     MPI_Barrier(MPI_COMM_WORLD);
+
+    /* Optional: register the CUDA buffer with UCC mem registry */
+    ucc_mem_h   cuda_mem = NULL;
+    ucc_memory_info_t cuda_mem_info;
+    if (use_reg) {
+        cuda_mem_info.address = d_source;
+        cuda_mem_info.length  = buf_len;
+        status = ucc_mem_register(ucc_context, &cuda_mem_info, 1, &cuda_mem);
+        if (status != UCC_OK) {
+            fprintf(stderr, "ucc_mem_register failed: %d\n", (int)status);
+        } else {
+            printf("Rank %d: CUDA buffer registered with UCC mem registry\n", me);
+        }
+    }
 
     if (hw_iface) {
         hw_counters_available_check.hw_counters_available = check_hw_counters_available(hw_counter_base_path);
@@ -346,12 +344,12 @@ int main(int argc, char ** argv)
 
         hw_counter_data_t total_size_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
 
-        // Initialize total counters to zero
         if (hw_iface && hw_counters_available_check.hw_counters_available) {
             for (int i = 0; i < NUM_HW_COUNTERS; i++) {
                 total_size_counters.counters[i] = 0;
             }
         }
+
         /* alltoall */
         for (int i = 0; i < iter + SKIP; i++) {
             long * a_psync = pSync;
@@ -363,22 +361,26 @@ int main(int argc, char ** argv)
                 .coll_type = UCC_COLL_TYPE_ALLTOALL,
                 .src.info =
                     {
-                        .buffer   = (void *)source,
+                        .buffer   = (void *)d_source,
                         .count    = k * npes,
                         .datatype = UCC_DT_INT64,
-                        .mem_type = UCC_MEMORY_TYPE_HOST,
+                        .mem_type = UCC_MEMORY_TYPE_CUDA,
                     },
                 .dst.info =
                     {
-                        .buffer   = (void *)dest,
+                        .buffer   = (void *)d_source,
                         .count    = k * npes,
                         .datatype = UCC_DT_INT64,
-                        .mem_type = UCC_MEMORY_TYPE_HOST,
+                        .mem_type = UCC_MEMORY_TYPE_CUDA,
                     },
                 .global_work_buffer = a_psync,
             };
 
-            // Start hardware counter measurement for this iteration
+            if (cuda_mem) {
+                coll_args.src.info.mem_handle = cuda_mem;
+                coll_args.dst.info.mem_handle = cuda_mem;
+            }
+
             hw_counter_data_t iter_start_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
             if (hw_iface && hw_counters_available_check.hw_counters_available) {
                 read_hw_counters(&iter_start_counters, hw_counter_base_path);
@@ -412,11 +414,9 @@ int main(int argc, char ** argv)
             MPI_Barrier(MPI_COMM_WORLD);
             end = MPI_Wtime();
 
-            // Stop hardware counter measurement for this iteration
             hw_counter_data_t iter_end_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
             if (hw_iface && hw_counters_available_check.hw_counters_available && i >= SKIP) {
                 read_hw_counters(&iter_end_counters, hw_counter_base_path);
-                // Accumulate counter differences for valid iterations
                 for (int j = 0; j < NUM_HW_COUNTERS; j++) {
                     total_size_counters.counters[j] += (iter_end_counters.counters[j] - iter_start_counters.counters[j]);
                 }
@@ -439,14 +439,11 @@ int main(int argc, char ** argv)
             MPI_Barrier(MPI_COMM_WORLD);
         }
 
-        // Aggregate hardware counter results across all processes using MPI
         hw_counter_data_t global_counters = {.hw_counters_available = hw_counters_available_check.hw_counters_available};
         if (hw_iface && hw_counters_available_check.hw_counters_available) {
-            // Initialize global counters to zero
             for (int j = 0; j < NUM_HW_COUNTERS; j++) {
                 global_counters.counters[j] = 0;
             }
-            // Sum hardware counters across all processes using MPI_Allreduce
             for (int j = 0; j < NUM_HW_COUNTERS; j++) {
                 local_count = total_size_counters.counters[j];
                 MPI_Allreduce(&local_count, &global_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
@@ -465,8 +462,6 @@ int main(int argc, char ** argv)
         double n = (double)npes * (double)iter;
         double avg_time = global_total / npes;
         double global_mean = global_total / n;
-        /* Combine per-rank Welford M2 with correction for difference between
-         * local and global mean, then allreduce for numerically stable variance. */
         double local_dev_sq = welford_M2 + (welford_mean - global_mean) *
                               (welford_mean - global_mean) * welford_count;
         double global_dev_sq;
@@ -500,7 +495,6 @@ int main(int argc, char ** argv)
             }
             printf("\n");
 
-            /* CSV row */
             if (csv_fp) {
                 bench_csv_row(csv_fp, &meta,
                               k * sizeof(uint64_t), (int)iter,
@@ -514,11 +508,15 @@ int main(int argc, char ** argv)
     MPI_Barrier(MPI_COMM_WORLD);
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
     transport_free(tls_str);
-    
-    free(source);
+
+    if (cuda_mem) {
+        ucc_mem_deregister(ucc_context, &cuda_mem, 1);
+    }
+
+    cudaFree(d_source);
     free(pSync);
     free(maps);
-    
+
     MPI_Finalize();
     return 0;
 }

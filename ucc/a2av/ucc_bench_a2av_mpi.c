@@ -4,6 +4,7 @@
  *  Meant to be used with MPI
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -15,6 +16,9 @@
 #include <getopt.h>
 
 #include <ucc/api/ucc.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 #define NR_ITER     100
 #define SKIP        10
@@ -128,6 +132,8 @@ int main(int argc, char ** argv)
     size_t iter = NR_ITER;
     int ppn = 1;
     int monitor_hw_counters = 0;
+    const char *csv_path = NULL;
+    FILE       *csv_fp   = NULL;
     ucc_context_params_t ctx_params;
     ucc_context_config_h ctx_config;
     ucc_context_h ucc_context;
@@ -147,27 +153,29 @@ int main(int argc, char ** argv)
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
 
     char c;
-    while ((c = getopt(argc, argv, "i:s:d:p:c")) != -1) {
+    while ((c = getopt(argc, argv, "i:s:d:p:co:")) != -1) {
         switch (c) {
-            case 's':
-                size = atoi(optarg);
-                break;
-            case 'i':
-                iter = atoi(optarg);
-                break;
-            case 'd':
-                num = atoi(optarg);
-                break;
-            case 'p':
-                ppn = atoi(optarg);
-                break;
-            case 'c':
-                monitor_hw_counters = 1;
-                break;
-            default:
-                return -1;
+            case 's': size           = atoi(optarg); break;
+            case 'i': iter           = atoi(optarg); break;
+            case 'd': num            = atoi(optarg); break;
+            case 'p': ppn            = atoi(optarg); break;
+            case 'c': monitor_hw_counters = 1;       break;
+            case 'o': csv_path       = optarg;        break;
+            default: return -1;
         }
     }
+
+    /* CSV output file */
+    if (!csv_path) csv_path = getenv("BENCH_CSV");
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
+    }
+
+    bench_meta_t meta = { "ucc_a2av", "mpi", npes, ppn, NULL };
+    char *tls_str = transport_detect();
+    if (tls_str) meta.tls = tls_str;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     // Allocate count and displacement arrays
     src_count = malloc(sizeof(int64_t) * npes);
@@ -399,11 +407,21 @@ int main(int argc, char ** argv)
             printf("%13.2f", min_latency * 1e6);
             printf("%13.2f", max_latency * 1e6);
             printf("\n");
+
+            if (csv_fp) {
+                bench_csv_row(csv_fp, &meta,
+                              k * sizeof(uint64_t), (int)iter,
+                              avg_time * 1e6 / iter, min_latency * 1e6,
+                              max_latency * 1e6, 0.0,
+                              bandwidth / (1024.0 * 1024.0));
+            }
         }
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
-    
+    if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
+
     // Cleanup
     free(source);
     free(dest);

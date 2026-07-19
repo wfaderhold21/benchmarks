@@ -14,16 +14,21 @@
  *   -f N   : per-rank message size in bytes at which to trigger failure (default 8192)
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <mpi.h>
 #include <limits.h>
+#include <math.h>
 #include <string.h>
 #include <unistd.h>
 #include <malloc.h>
 
 #include <ucc/api/ucc.h>
+
+#include "../../common/bench_output.h"
+#include "../../common/transport_detect.h"
 
 #define NR_ITER  100
 #define SKIP     10
@@ -79,8 +84,9 @@ static void print_header(void)
  * Run alltoall for k values [start_k, end_k] (doubling each step).
  * Reports per-message-size bandwidth/latency stats to stdout from rank 0.
  */
-static int run_a2a_phase(int me, int npes, int start_k, int end_k,
-                          size_t iter, int ppn,
+static int run_a2a_phase(int me, int npes, int world_size, int start_k, int end_k,
+                          size_t iter, int ppn, const char *variant,
+                          FILE *csv_fp, const char *tls,
                           int64_t *source, int64_t *dest, long *pSync,
                           ucc_team_h team, ucc_context_h ctx, MPI_Comm comm)
 {
@@ -184,6 +190,15 @@ static int run_a2a_phase(int me, int npes, int start_k, int end_k,
                    gmin * 1e6,
                    gmax * 1e6,
                    var_us2);
+
+            if (csv_fp) {
+                bench_meta_t m = { "ucc_a2a", variant, world_size, ppn, tls };
+                bench_csv_row(csv_fp, &m,
+                              k * sizeof(uint64_t), (int)iter,
+                              avg_total / iter * 1e6, gmin * 1e6,
+                              gmax * 1e6, sqrt(var_us2),
+                              bw / (1024.0 * 1024.0));
+            }
         }
     }
     return 0;
@@ -197,6 +212,8 @@ int main(int argc, char **argv)
     int ppn              = 1;
     int kill_count       = 1;
     int fail_after_bytes = 8192;    /* fail after per-rank msg size of this many bytes */
+    const char *csv_path = NULL;
+    FILE       *csv_fp   = NULL;
     char c;
     ucc_status_t status;
 
@@ -204,12 +221,13 @@ int main(int argc, char **argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
 
-    while ((c = getopt(argc, argv, "i:p:k:f:")) != -1) {
+    while ((c = getopt(argc, argv, "i:p:k:f:o:")) != -1) {
         switch (c) {
             case 'i': iter             = (size_t)atoi(optarg); break;
             case 'p': ppn              = atoi(optarg);         break;
             case 'k': kill_count       = atoi(optarg);         break;
             case 'f': fail_after_bytes = atoi(optarg);         break;
+            case 'o': csv_path         = optarg;               break;
             default:
                 if (me == 0)
                     fprintf(stderr,
@@ -218,6 +236,19 @@ int main(int argc, char **argv)
                 MPI_Finalize();
                 return 1;
         }
+    }
+
+    /* CSV output file */
+    if (!csv_path) csv_path = getenv("BENCH_CSV");
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
+    }
+
+    char *tls_str = transport_detect();
+    if (csv_fp && me == 0) {
+        bench_meta_t m = { "ucc_a2a", "", npes, ppn, tls_str ? tls_str : "" };
+        bench_csv_header(csv_fp);
     }
 
     if (kill_count < 1 || kill_count >= npes) {
@@ -336,7 +367,8 @@ int main(int argc, char **argv)
         print_header();
     }
 
-    if (run_a2a_phase(me, npes, 1, fail_after_k, iter, ppn,
+    if (run_a2a_phase(me, npes, npes, 1, fail_after_k, iter, ppn, "pre_failure",
+                      csv_fp, tls_str ? tls_str : "",
                       source, dest, pSync, ucc_team, ucc_context,
                       MPI_COMM_WORLD) != 0)
         return -1;
@@ -533,7 +565,8 @@ int main(int argc, char **argv)
     }
 
     if (start_k <= count) {
-        if (run_a2a_phase(new_me, new_npes, start_k, count, iter, ppn,
+        if (run_a2a_phase(new_me, new_npes, npes, start_k, count, iter, ppn, "post_recovery",
+                          csv_fp, tls_str ? tls_str : "",
                           source, dest, pSync, new_team, new_ctx,
                           new_comm) != 0)
             return -1;
@@ -545,6 +578,9 @@ int main(int argc, char **argv)
         ucc_context_progress(new_ctx);
     ucc_context_destroy(new_ctx);
     ucc_finalize(ucc_lib);
+    if (csv_fp && new_me == 0) { fflush(csv_fp); fclose(csv_fp); }
+    transport_free(tls_str);
+
     free(source);
     free(pSync);
     MPI_Comm_free(&new_comm);
