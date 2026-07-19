@@ -192,7 +192,7 @@ static int run_a2a_phase(int me, int npes, int world_size, int start_k, int end_
                    var_us2);
 
             if (csv_fp) {
-                bench_meta_t m = { "ucc_a2a", variant, world_size, ppn, tls };
+                bench_meta_t m = { "ucc_a2a", variant, world_size, ppn, tls ? tls : "", "" };
                 bench_csv_row(csv_fp, &m,
                               k * sizeof(uint64_t), (int)iter,
                               avg_total / iter * 1e6, gmin * 1e6,
@@ -238,17 +238,14 @@ int main(int argc, char **argv)
         }
     }
 
-    /* CSV output file */
+    /* CSV output file - only rank 0 opens */
     if (!csv_path) csv_path = getenv("BENCH_CSV");
-    if (csv_path) {
-        csv_fp = fopen(csv_path, "w");
-        if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
-    }
 
-    char *tls_str = transport_detect();
-    if (csv_fp && me == 0) {
-        bench_meta_t m = { "ucc_a2a", "", npes, ppn, tls_str ? tls_str : "" };
-        bench_csv_header(csv_fp);
+    if (csv_path && me == 0) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) {
+            fprintf(stderr, "[rank %d] cannot open CSV: %s\n", me, csv_path);
+        }
     }
 
     if (kill_count < 1 || kill_count >= npes) {
@@ -359,6 +356,21 @@ int main(int argc, char **argv)
     }
     MPI_Barrier(MPI_COMM_WORLD);
 
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti = transport_detect();
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+
+    if (me == 0) {
+        printf("=== PHASE 1: PRE-FAILURE (%d ranks) ===\n", npes);
+        print_header();
+    }
+
+    if (run_a2a_phase(me, npes, npes, 1, fail_after_k, iter, ppn, "pre_failure",
+                      csv_fp, (ti.ucc_tls && strlen(ti.ucc_tls) > 0) ? ti.ucc_tls : "",
+                      source, dest, pSync, ucc_team, ucc_context,
+                      MPI_COMM_WORLD) != 0)
+        return -1;
+
     /* ================================================================
      * PHASE 1: Pre-failure alltoall benchmark (all ranks)
      * ================================================================ */
@@ -367,11 +379,7 @@ int main(int argc, char **argv)
         print_header();
     }
 
-    if (run_a2a_phase(me, npes, npes, 1, fail_after_k, iter, ppn, "pre_failure",
-                      csv_fp, tls_str ? tls_str : "",
-                      source, dest, pSync, ucc_team, ucc_context,
-                      MPI_COMM_WORLD) != 0)
-        return -1;
+
 
     /* ================================================================
      * FAILURE + RECOVERY via UCC resilience API
@@ -566,7 +574,7 @@ int main(int argc, char **argv)
 
     if (start_k <= count) {
         if (run_a2a_phase(new_me, new_npes, npes, start_k, count, iter, ppn, "post_recovery",
-                          csv_fp, tls_str ? tls_str : "",
+                          csv_fp, (ti.ucc_tls && strlen(ti.ucc_tls) > 0) ? ti.ucc_tls : "",
                           source, dest, pSync, new_team, new_ctx,
                           new_comm) != 0)
             return -1;
@@ -579,7 +587,8 @@ int main(int argc, char **argv)
     ucc_context_destroy(new_ctx);
     ucc_finalize(ucc_lib);
     if (csv_fp && new_me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
+    transport_free(ti.ucc_tls);
+    transport_free(ti.ucx_tls);
 
     free(source);
     free(pSync);

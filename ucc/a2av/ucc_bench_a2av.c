@@ -13,6 +13,7 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <string.h>
+#include <getopt.h>
 
 #include <ucc/api/ucc.h>
 
@@ -134,7 +135,17 @@ int main(int argc, char ** argv)
     ucc_count_t *src_count, *dst_count;
     ucc_aint_t *src_disp, *dst_disp;
 
-    if (argc > 1) {
+    const char *csv_path_cli = NULL;
+    char c;
+    while ((c = getopt(argc, argv, "o:")) != -1) {
+        switch (c) {
+            case 'o': csv_path_cli = optarg; break;
+            default: break;
+        }
+    }
+    if (csv_path_cli) {
+        csv_path = csv_path_cli;
+    } else if (argc > 1) {
         size = atoi(argv[1]) / 8;
         count = size;
         if (argc > 2) {
@@ -145,17 +156,14 @@ int main(int argc, char ** argv)
     me = shmem_my_pe();
     npes = shmem_n_pes();
 
-    /* CSV output file */
+    /* CSV output file - only rank 0 opens */
     csv_path = getenv("BENCH_CSV");
-    if (csv_path) {
+    if (csv_path && me == 0) {
         csv_fp = fopen(csv_path, "w");
         if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
 
-    bench_meta_t meta = { "ucc_a2av", "shmem", npes, 1, NULL };
-    char *tls_str = transport_detect();
-    if (tls_str) meta.tls = tls_str;
-    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+    bench_meta_t meta = { "ucc_a2av", "shmem", npes, 1, NULL, NULL };
 
     src_count = malloc(sizeof(int64_t) * npes);
     dst_count = malloc(sizeof(int64_t) * npes);
@@ -256,8 +264,15 @@ int main(int argc, char ** argv)
         return -1; 
     }
     shmem_barrier_all();
+
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti = transport_detect();
+    meta.ucc_tls = ti.ucc_tls;
+    meta.ucx_tls = ti.ucx_tls;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+
     if (me == 0) {
-        printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size", 
+        printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size",
                                               "PE size",
                                               "Bandwidth MB/s", 
                                               "Agg MB/s",
@@ -400,7 +415,8 @@ int main(int argc, char ** argv)
 
     shmem_barrier_all();
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
+    transport_free(ti.ucc_tls);
+    transport_free(ti.ucx_tls);
     shmem_quiet();
     shmem_finalize();
     return 0;

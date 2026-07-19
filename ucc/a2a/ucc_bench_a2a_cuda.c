@@ -193,16 +193,14 @@ int main(int argc, char ** argv)
         }
     }
 
+    /* CSV output file - only rank 0 opens */
     if (!csv_path) csv_path = getenv("BENCH_CSV");
-    if (csv_path) {
+    if (csv_path && me == 0) {
         csv_fp = fopen(csv_path, "w");
         if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
 
-    bench_meta_t meta = { "ucc_a2a", use_reg ? "cuda_reg" : "cuda", npes, ppn, NULL };
-    char *tls_str = transport_detect();
-    if (tls_str) meta.tls = tls_str;
-    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+    bench_meta_t meta = { "ucc_a2a", use_reg ? "cuda_reg" : "cuda", npes, ppn, NULL, NULL };
 
     if (hw_iface) {
         snprintf(hw_counter_base_path, sizeof(hw_counter_base_path),
@@ -212,8 +210,10 @@ int main(int argc, char ** argv)
     size_t buf_len = npes * count * sizeof(int64_t);
     int64_t* d_source;
     cuda_or_die(cudaMalloc((void **)&d_source, buf_len), "cudaMalloc source");
+    int64_t* d_dest;
+    cuda_or_die(cudaMalloc((void **)&d_dest, buf_len), "cudaMalloc dest");
 
-    maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t));
+    maps = (ucc_mem_map_t *)malloc(sizeof(ucc_mem_map_t) * 2);
     if (maps == NULL) {
         printf("OOM\n");
         return -1;
@@ -221,6 +221,8 @@ int main(int argc, char ** argv)
 
     maps[0].address = d_source;
     maps[0].len     = buf_len;
+    maps[1].address = d_dest;
+    maps[1].len     = buf_len;
 
     ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB | UCC_CONTEXT_PARAM_FIELD_MEM_PARAMS;
     ctx_params.oob.allgather = oob_allgather;
@@ -229,7 +231,7 @@ int main(int argc, char ** argv)
     ctx_params.oob.coll_info = (void *)MPI_COMM_WORLD;
     ctx_params.oob.n_oob_eps = npes;
     ctx_params.oob.oob_ep    = me;
-    ctx_params.mem_params.n_segments = 1;
+    ctx_params.mem_params.n_segments = 2;
     ctx_params.mem_params.segments   = maps;
 
     ucc_lib_params_t lib_params = {
@@ -291,6 +293,12 @@ int main(int argc, char ** argv)
         return -1;
     }
     MPI_Barrier(MPI_COMM_WORLD);
+
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti = transport_detect();
+    meta.ucc_tls = ti.ucc_tls;
+    meta.ucx_tls = ti.ucx_tls;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     /* Optional: register the CUDA buffer with UCC mem registry */
     ucc_mem_h   cuda_mem = NULL;
@@ -356,8 +364,7 @@ int main(int argc, char ** argv)
             ucc_coll_args_t coll_args = {
                 .mask      = UCC_COLL_ARGS_FIELD_FLAGS | UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
                 .flags     = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS |
-                              UCC_COLL_ARGS_FLAG_IN_PLACE |
-                              UCC_COLL_ARGS_FLAG_PERSISTENT,
+                               UCC_COLL_ARGS_FLAG_PERSISTENT,
                 .coll_type = UCC_COLL_TYPE_ALLTOALL,
                 .src.info =
                     {
@@ -368,7 +375,7 @@ int main(int argc, char ** argv)
                     },
                 .dst.info =
                     {
-                        .buffer   = (void *)d_source,
+                        .buffer   = (void *)d_dest,
                         .count    = k * npes,
                         .datatype = UCC_DT_INT64,
                         .mem_type = UCC_MEMORY_TYPE_CUDA,
@@ -507,15 +514,18 @@ int main(int argc, char ** argv)
 
     MPI_Barrier(MPI_COMM_WORLD);
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
 
     if (cuda_mem) {
         ucc_mem_deregister(ucc_context, &cuda_mem, 1);
     }
 
     cudaFree(d_source);
+    cudaFree(d_dest);
     free(pSync);
     free(maps);
+
+    transport_free(ti.ucc_tls);
+    transport_free(ti.ucx_tls);
 
     MPI_Finalize();
     return 0;

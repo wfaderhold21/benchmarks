@@ -217,26 +217,24 @@ int main(int argc, char ** argv)
         }
     }
 
-    /* Open CSV output file (CLI override or BENCH_CSV env var) */
+    /* Open CSV output file - only rank 0 opens */
     if (!csv_path) {
         csv_path = getenv("BENCH_CSV");
-    }
-    if (csv_path) {
-        csv_fp = fopen(csv_path, "w");
-        if (!csv_fp) {
-            fprintf(stderr, "cannot open CSV file: %s\n", csv_path);
-        }
     }
 
     shmem_init();
     me = shmem_my_pe();
     npes = shmem_n_pes();
 
+    if (csv_path && me == 0) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) {
+            fprintf(stderr, "cannot open CSV file: %s\n", csv_path);
+        }
+    }
+
     /* CSV metadata */
-    bench_meta_t meta = { "ucc_a2a", "shmem", npes, ppn, NULL };
-    char *tls_str = transport_detect();
-    if (tls_str) meta.tls = tls_str;
-    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+    bench_meta_t meta = { "ucc_a2a", "shmem", npes, ppn, NULL, NULL };
 
 #ifndef WITH_MEMH
     int64_t* source = (int64_t *) shmem_malloc(npes * count * sizeof(int64_t));
@@ -335,6 +333,12 @@ int main(int argc, char ** argv)
         return -1; 
     }
     shmem_barrier_all();
+
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti = transport_detect();
+    meta.ucc_tls = ti.ucc_tls;
+    meta.ucx_tls = ti.ucx_tls;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     // Initialize hardware counter monitoring if enabled
     if (monitor_hw_counters) {
@@ -555,7 +559,8 @@ int main(int argc, char ** argv)
     shmem_barrier_all();
     shmem_quiet();
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
+    transport_free(ti.ucc_tls);
+    transport_free(ti.ucx_tls);
     shmem_finalize();
     return 0;
 }

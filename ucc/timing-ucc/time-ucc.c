@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <string.h>
+#include <getopt.h>
 #include <math.h>
 
 #include <ucc/api/ucc.h>
@@ -21,81 +22,6 @@
 
 #define NR_ITER     10
 #define SKIP        1
-#define MAX_TLS     32
-
-// Structure to collect loaded UCC TLs
-typedef struct {
-    char tl_names[MAX_TLS][64];
-    int count;
-} ucc_tl_list_t;
-
-// Callback for dl_iterate_phdr to find loaded UCC TLs
-static int find_ucc_tls_callback(struct dl_phdr_info *info, size_t size, void *data) {
-    ucc_tl_list_t *tl_list = (ucc_tl_list_t *)data;
-    const char *name = info->dlpi_name;
-    
-    if (name && strlen(name) > 0) {
-        // Look for libucc_tl_*.so pattern
-        const char *basename = strrchr(name, '/');
-        basename = basename ? basename + 1 : name;
-        
-        if (strncmp(basename, "libucc_tl_", 10) == 0) {
-            // Extract TL name between "libucc_tl_" and ".so"
-            const char *tl_start = basename + 10;
-            const char *tl_end = strstr(tl_start, ".so");
-            
-            if (tl_end && tl_list->count < MAX_TLS) {
-                size_t len = tl_end - tl_start;
-                if (len > 0 && len < 63) {
-                    strncpy(tl_list->tl_names[tl_list->count], tl_start, len);
-                    tl_list->tl_names[tl_list->count][len] = '\0';
-                    tl_list->count++;
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-// Get list of loaded UCC TLs
-static void get_loaded_ucc_tls(ucc_tl_list_t *tl_list) {
-    tl_list->count = 0;
-    dl_iterate_phdr(find_ucc_tls_callback, tl_list);
-}
-
-// Callback for dl_iterate_phdr to find loaded UCX transports
-static int find_ucx_tls_callback(struct dl_phdr_info *info, size_t size, void *data) {
-    ucc_tl_list_t *tl_list = (ucc_tl_list_t *)data;
-    const char *name = info->dlpi_name;
-    
-    if (name && strlen(name) > 0) {
-        // Look for libuct_*.so pattern (UCX transport libraries)
-        const char *basename = strrchr(name, '/');
-        basename = basename ? basename + 1 : name;
-        
-        if (strncmp(basename, "libuct_", 7) == 0) {
-            // Extract transport name between "libuct_" and ".so"
-            const char *tl_start = basename + 7;
-            const char *tl_end = strstr(tl_start, ".so");
-            
-            if (tl_end && tl_list->count < MAX_TLS) {
-                size_t len = tl_end - tl_start;
-                if (len > 0 && len < 63) {
-                    strncpy(tl_list->tl_names[tl_list->count], tl_start, len);
-                    tl_list->tl_names[tl_list->count][len] = '\0';
-                    tl_list->count++;
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-// Get list of loaded UCX transports
-static void get_loaded_ucx_transports(ucc_tl_list_t *tl_list) {
-    tl_list->count = 0;
-    dl_iterate_phdr(find_ucx_tls_callback, tl_list);
-}
 
 static void write_csv_timing(const char *bench_name, FILE *csv_fp,
                               bench_meta_t *meta, double *times, int count)
@@ -151,24 +77,22 @@ void print_statistics(const char *label, double *times, int count, int rank) {
     printf("  Variance:    %.2f ms²\n", variance * 1000000);
 }
 
-void print_ucc_info(ucc_lib_h lib, ucc_context_h ctx, int rank) {
-    if (rank != 0) return;
-    
+void print_ucc_info(ucc_lib_h lib, ucc_context_h ctx, int rank, const transport_info_t *ti) {
+    if (rank != 0 || !ti) return;
+
     printf("\n=== UCC Configuration ===\n");
-    
-    // Print UCC library attributes
+
     ucc_lib_attr_t lib_attr;
     lib_attr.mask = UCC_LIB_ATTR_FIELD_THREAD_MODE;
     if (UCC_OK == ucc_lib_get_attr(lib, &lib_attr)) {
         printf("  Thread mode: %d\n", lib_attr.thread_mode);
     }
-    
-    // Query UCC context attributes to get TL information
+
     ucc_context_attr_t ctx_attr;
     ctx_attr.mask = UCC_CONTEXT_ATTR_FIELD_CTX_ADDR | 
                     UCC_CONTEXT_ATTR_FIELD_CTX_ADDR_LEN |
                     UCC_CONTEXT_ATTR_FIELD_WORK_BUFFER_SIZE;
-    
+
     if (UCC_OK == ucc_context_get_attr(ctx, &ctx_attr)) {
         printf("  Context Attributes:\n");
         if (ctx_attr.mask & UCC_CONTEXT_ATTR_FIELD_CTX_ADDR_LEN) {
@@ -178,50 +102,28 @@ void print_ucc_info(ucc_lib_h lib, ucc_context_h ctx, int rank) {
             printf("    Work buffer size: %zu bytes\n", ctx_attr.global_work_buffer_size);
         }
     }
-    
-    // Get actually loaded TLs by examining loaded shared libraries
-    printf("\n  Loaded Transport Layers (via dl_iterate_phdr):\n");
-    
-    ucc_tl_list_t loaded_tls;
-    get_loaded_ucc_tls(&loaded_tls);
-    
-    if (loaded_tls.count > 0) {
-        printf("    Found %d loaded UCC TL%s:\n", loaded_tls.count, 
-               loaded_tls.count > 1 ? "s" : "");
-        for (int i = 0; i < loaded_tls.count; i++) {
-            printf("      - %s", loaded_tls.tl_names[i]);
-            
-            // Add descriptions for known TLs
-            if (strcmp(loaded_tls.tl_names[i], "ucp") == 0) {
-                printf(" (UCX Protocol - general purpose)");
-            } else if (strcmp(loaded_tls.tl_names[i], "nccl") == 0) {
-                printf(" (NVIDIA NCCL - GPU collectives)");
-            } else if (strcmp(loaded_tls.tl_names[i], "sharp") == 0) {
-                printf(" (Mellanox SHARP - in-network aggregation)");
-            } else if (strcmp(loaded_tls.tl_names[i], "self") == 0) {
-                printf(" (Self/loopback)");
-            } else if (strcmp(loaded_tls.tl_names[i], "shm") == 0) {
-                printf(" (Shared memory)");
-            } else if (strcmp(loaded_tls.tl_names[i], "cuda") == 0) {
-                printf(" (CUDA-aware collectives)");
-            } else if (strcmp(loaded_tls.tl_names[i], "rocm") == 0) {
-                printf(" (ROCm/HIP-aware collectives)");
-            }
-            printf("\n");
-        }
+
+    /* Print loaded TLs from transport_detect result */
+    printf("\n  Loaded Transport Layers:\n");
+    if (ti->ucc_tls && strlen(ti->ucc_tls) > 0) {
+        printf("    UCC TLs: %s\n", ti->ucc_tls);
     } else {
-        printf("    No UCC TL libraries detected (they may load later)\n");
+        printf("    No UCC TL libraries detected\n");
     }
-    
-    // Show what was requested vs what's loaded
+    if (ti->ucx_tls && strlen(ti->ucx_tls) > 0) {
+        printf("    UCX transports: %s\n", ti->ucx_tls);
+    } else {
+        printf("    No UCX transport libraries detected\n");
+    }
+
     char *requested_tls = getenv("UCC_TLS");
     if (requested_tls) {
         printf("    Requested via UCC_TLS: %s\n", requested_tls);
     } else {
         printf("    UCC_TLS not set (using all available TLs)\n");
     }
-    
-    // Print environment variables related to transports
+
+    /* Print environment variables related to transports */
     printf("\n  Transport Environment Variables:\n");
     char *env_vars[] = {
         "UCC_TLS",
@@ -234,7 +136,7 @@ void print_ucc_info(ucc_lib_h lib, ucc_context_h ctx, int rank) {
         "NCCL_NET_GDR_LEVEL",
         NULL
     };
-    
+
     int found_count = 0;
     for (int i = 0; env_vars[i] != NULL; i++) {
         char *val = getenv(env_vars[i]);
@@ -243,53 +145,16 @@ void print_ucc_info(ucc_lib_h lib, ucc_context_h ctx, int rank) {
             found_count++;
         }
     }
-    
+
     if (found_count == 0) {
         printf("    (No transport environment variables set - using UCC/UCX defaults)\n");
     }
-    
-    // Print UCX transport information (loaded libuct_*.so libraries)
-    printf("\n  Loaded UCX Transports (via dl_iterate_phdr):\n");
-    
-    ucc_tl_list_t ucx_transports;
-    get_loaded_ucx_transports(&ucx_transports);
-    
-    if (ucx_transports.count > 0) {
-        printf("    Found %d loaded UCX transport%s:\n", ucx_transports.count,
-               ucx_transports.count > 1 ? "s" : "");
-        for (int i = 0; i < ucx_transports.count; i++) {
-            printf("      - %s", ucx_transports.tl_names[i]);
-            
-            // Add descriptions for known UCX transports
-            if (strstr(ucx_transports.tl_names[i], "ib") || 
-                strstr(ucx_transports.tl_names[i], "mlx")) {
-                printf(" (InfiniBand/Mellanox)");
-            } else if (strstr(ucx_transports.tl_names[i], "tcp")) {
-                printf(" (TCP/IP sockets)");
-            } else if (strstr(ucx_transports.tl_names[i], "sm") || 
-                       strstr(ucx_transports.tl_names[i], "shm")) {
-                printf(" (Shared Memory)");
-            } else if (strstr(ucx_transports.tl_names[i], "self")) {
-                printf(" (Loopback)");
-            } else if (strstr(ucx_transports.tl_names[i], "cuda")) {
-                printf(" (NVIDIA CUDA)");
-            } else if (strstr(ucx_transports.tl_names[i], "rocm") ||
-                       strstr(ucx_transports.tl_names[i], "gdr")) {
-                printf(" (GPU Direct)");
-            }
-            printf("\n");
-        }
-    } else {
-        printf("    No UCX transport libraries detected\n");
-    }
-    
-    // Show UCX_TLS configuration if set
-    char *ucx_tls = getenv("UCX_TLS");
-    if (ucx_tls) {
-        printf("    Requested via UCX_TLS: %s\n", ucx_tls);
+
+    char *ucx_tls_env = getenv("UCX_TLS");
+    if (ucx_tls_env) {
+        printf("    Requested via UCX_TLS: %s\n", ucx_tls_env);
     } else {
         printf("    UCX_TLS not set (auto-detection enabled)\n");
-        printf("    Tip: Set UCX_LOG_LEVEL=INFO to see transport selection details\n");
     }
 }
 
@@ -343,22 +208,28 @@ int main(int argc, char ** argv)
     ucc_lib_h ucc_lib;
     const char *csv_path = NULL;
     FILE       *csv_fp   = NULL;
+    char c;
+
+    /* Support -o flag for CSV output path */
+    while ((c = getopt(argc, argv, "o:")) != -1) {
+        switch (c) {
+            case 'o': csv_path = optarg; break;
+            default: break;
+        }
+    }
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
     MPI_Comm_size(MPI_COMM_WORLD, &npes);
 
-    /* CSV output file */
-    csv_path = getenv("BENCH_CSV");
-    if (csv_path) {
+    /* CSV output file - only rank 0 opens */
+    if (!csv_path) csv_path = getenv("BENCH_CSV");
+    if (csv_path && me == 0) {
         csv_fp = fopen(csv_path, "w");
         if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
 
-    bench_meta_t meta = { NULL, NULL, npes, 1, NULL };
-    char *tls_str = transport_detect();
-    if (tls_str) meta.tls = tls_str;
-    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+    bench_meta_t meta = { NULL, NULL, npes, 1, NULL, NULL };
 
     // Allocate timing arrays
     ctx_times = (double *) malloc(sizeof(double) * NR_ITER);
@@ -471,6 +342,12 @@ int main(int argc, char ** argv)
         return -1;
     }
 
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti = transport_detect();
+    meta.ucc_tls = ti.ucc_tls;
+    meta.ucx_tls = ti.ucx_tls;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+
     print_statistics("Context Creation", ctx_times, ctx_time_count, me);
     if (me == 0) write_csv_timing("ctx_create", csv_fp, &meta, ctx_times, ctx_time_count);
 
@@ -526,17 +403,18 @@ int main(int argc, char ** argv)
     print_statistics("Team Creation", team_times, team_time_count, me);
     if (me == 0) write_csv_timing("team_create", csv_fp, &meta, team_times, team_time_count);
 
-    // Print UCC configuration info
-    print_ucc_info(ucc_lib, ucc_context[NR_ITER], me);
-    
+    /* Print UCC configuration info */
+    print_ucc_info(ucc_lib, ucc_context[NR_ITER], me, &ti);
+
     if (me == 0) {
         printf("\n========================================\n");
         printf("Benchmark completed successfully\n");
         printf("========================================\n");
     }
-    
+
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
+    transport_free(ti.ucc_tls);
+    transport_free(ti.ucx_tls);
 
     // Cleanup
     free(ctx_times);

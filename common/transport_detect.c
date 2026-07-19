@@ -80,7 +80,22 @@ static int find_ucx_tls_cb(struct dl_phdr_info *info, size_t size, void *data)
 
 /* ---------- Public API ---------- */
 
-char *transport_detect(void)
+static char *build_tl_string(const tl_list_t *list)
+{
+    if (list->count == 0) return strdup("");
+    size_t cap = (size_t)list->count * 70 + 1;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return NULL;
+
+    int n = 0;
+    for (int i = 0; i < list->count; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "%s%s",
+                      n > 0 ? "," : "", list->names[i]);
+    }
+    return buf;
+}
+
+transport_info_t transport_detect(void)
 {
     tl_list_t ucc_tls, ucx_tls;
     ucc_tls.count = 0;
@@ -89,22 +104,12 @@ char *transport_detect(void)
     dl_iterate_phdr(find_ucc_tls_cb, &ucc_tls);
     dl_iterate_phdr(find_ucx_tls_cb, &ucx_tls);
 
-    /* worst-case: each name (63 chars) + comma, times (MAX_TLS*2), plus NUL */
-    size_t cap = (size_t)(ucc_tls.count + ucx_tls.count) * 70 + 1;
-    char  *buf = (char *)malloc(cap);
-    if (!buf) return NULL;
-
-    int n = 0;
-    for (int i = 0; i < ucc_tls.count; i++) {
-        n += snprintf(buf + n, cap - (size_t)n, "%s%s",
-                      n > 0 ? "," : "", ucc_tls.names[i]);
-    }
-    for (int i = 0; i < ucx_tls.count; i++) {
-        n += snprintf(buf + n, cap - (size_t)n, "%s%s",
-                      n > 0 ? "," : "", ucx_tls.names[i]);
-    }
-
-    return buf;
+    transport_info_t info;
+    info.ucc_tls = build_tl_string(&ucc_tls);
+    info.ucx_tls = build_tl_string(&ucx_tls);
+    if (!info.ucc_tls) info.ucc_tls = strdup("");
+    if (!info.ucx_tls) info.ucx_tls = strdup("");
+    return info;
 }
 
 void transport_free(char *s)

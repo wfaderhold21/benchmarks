@@ -165,17 +165,14 @@ int main(int argc, char ** argv)
         }
     }
 
-    /* CSV output file */
+    /* CSV output file - only rank 0 opens */
     if (!csv_path) csv_path = getenv("BENCH_CSV");
-    if (csv_path) {
+    if (csv_path && me == 0) {
         csv_fp = fopen(csv_path, "w");
         if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
 
-    bench_meta_t meta = { "ucc_a2av", "mpi", npes, ppn, NULL };
-    char *tls_str = transport_detect();
-    if (tls_str) meta.tls = tls_str;
-    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+    bench_meta_t meta = { "ucc_a2av", "mpi", npes, ppn, NULL, NULL };
 
     // Allocate count and displacement arrays
     src_count = malloc(sizeof(int64_t) * npes);
@@ -275,6 +272,12 @@ int main(int argc, char ** argv)
         return -1; 
     }
     MPI_Barrier(MPI_COMM_WORLD);
+
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti = transport_detect();
+    meta.ucc_tls = ti.ucc_tls;
+    meta.ucx_tls = ti.ucx_tls;
+    if (csv_fp && me == 0) bench_csv_header(csv_fp);
 
     if (me == 0) {
         printf("%-10s%-10s%15s%13s%13s%13s%13s%13s\n", "Size",
@@ -420,9 +423,10 @@ int main(int argc, char ** argv)
 
     MPI_Barrier(MPI_COMM_WORLD);
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
+    transport_free(ti.ucc_tls);
+    transport_free(ti.ucx_tls);
 
-    // Cleanup
+    /* Cleanup */
     free(source);
     free(dest);
     free(pSync);

@@ -17,7 +17,8 @@ typedef struct {
     const char *bench_name;     /* "ucc_a2a"        */
     const char *variant;        /* "mpi", "shrink"  */
     int         world_size, ppn;
-    const char *tls;            /* from env or transport_detect()   */
+    const char *ucc_tls;        /* UCC TLs from transport_detect()  */
+    const char *ucx_tls;        /* UCX transports from transport_detect() */
 } bench_meta_t;
 
 /* ---- helpers (all inline static so this is header-only) ---- */
@@ -39,7 +40,7 @@ bench_csv_header(FILE *f)
             "variant,"
             "nprocs,"
             "ppn,"
-            "tls,"
+            "ucc_tls,"
             "ucx_tls,"
             "msg_size,"
             "iters,"
@@ -59,16 +60,17 @@ bench_csv_row(FILE *f, const bench_meta_t *m,
     char ts[64];
     bench_iso8601(ts, sizeof(ts));
 
-    const char *tls  = m->tls  ? m->tls  : "";
+    const char *ucc_tls = m->ucc_tls ? m->ucc_tls : "";
+    const char *ucx_tls = m->ucx_tls ? m->ucx_tls : "";
 
-    fprintf(f, "%s,%s,%s,%d,%d,%s,,%zu,%d,"
+    fprintf(f, "%s,%s,%s,%d,%d,%s,%s,%zu,%d,"
             "%.2f,%.2f,%.2f,%.2f,%.2f\n",
             ts,
             m->bench_name,
             m->variant,
             m->world_size,
             m->ppn,
-            tls,
+            ucc_tls, ucx_tls,
             msg_size, iters,
             avg_us, min_us, max_us, stddev_us, bw_mbps);
 }

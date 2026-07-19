@@ -4,7 +4,7 @@ CC = mpicc
 HPCX = /work/nvidia/hpcx-v2.22-gcc-doca_ofed-ubuntu24.04-cuda12-x86_64
 UCC_DIR = $(HPCX)/ucc
 UCX_DIR = $(HPCX)/ucx
-CFLAGS = -Wall -O2 -g -I$(UCC_DIR)/include
+CFLAGS = -Wall -O2 -g -I$(UCC_DIR)/include -I../../common
 LDFLAGS = -L$(UCX_DIR)/lib -L$(UCC_DIR)/lib -lucc -lucs -lm
 
 TARGET = time-ucc
@@ -12,11 +12,11 @@ SRC = time-ucc.c
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
+$(TARGET): $(SRC) ../../common/transport_detect.o
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) ../../common/transport_detect.o $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) *.o ../../common/transport_detect.o
 
 run: $(TARGET)
 	mpirun -np 4 ./$(TARGET)

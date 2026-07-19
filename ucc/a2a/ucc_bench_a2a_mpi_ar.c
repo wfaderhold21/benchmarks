@@ -261,9 +261,24 @@ int main(int argc, char ** argv)
         }
     }
 
-    /* CSV output file */
+    /* CSV metadata */
+    bench_meta_t meta = { "ucc_a2a", "mpi_ar", world_npes, ppn, NULL, NULL };
+
+    if (hw_iface) {
+        hw_counters_available_check.hw_counters_available = check_hw_counters_available(hw_counter_base_path);
+        if (world_me == 0) {
+            if (hw_counters_available_check.hw_counters_available) {
+                printf("Hardware counter monitoring enabled for %s\n", hw_iface);
+            } else {
+                printf("Hardware counter monitoring requested for %s but counters not available, disabling\n", hw_iface);
+                hw_iface = NULL;
+            }
+        }
+    }
+
+    /* CSV output file - only rank 0 opens */
     if (!csv_path) csv_path = getenv("BENCH_CSV");
-    if (csv_path) {
+    if (csv_path && world_me == 0) {
         csv_fp = fopen(csv_path, "w");
         if (!csv_fp) fprintf(stderr, "cannot open CSV: %s\n", csv_path);
     }
@@ -283,11 +298,6 @@ int main(int argc, char ** argv)
     int sub_me, sub_npes;
     MPI_Comm_rank(sub_comm, &sub_me);
     MPI_Comm_size(sub_comm, &sub_npes);
-
-    if (hw_iface) {
-        snprintf(hw_counter_base_path, sizeof(hw_counter_base_path),
-                 "/sys/class/infiniband/%s/ports/1/hw_counters/", hw_iface);
-    }
 
     if (color == 1) {
         /* ---------- odd ranks: background allreduce ---------- */
@@ -361,29 +371,21 @@ int main(int argc, char ** argv)
 
     MPI_Barrier(sub_comm);
 
-    /* CSV metadata */
-    bench_meta_t meta = { "ucc_a2a", "mpi_ar", world_npes, ppn, NULL };
-    char *tls_str = transport_detect();
-    if (tls_str) meta.tls = tls_str;
-    if (csv_fp && me == 0) bench_csv_header(csv_fp);
+    /* Transport detection after UCC init for reliable results */
+    transport_info_t ti_ar = transport_detect();
 
-    if (hw_iface) {
-        hw_counters_available_check.hw_counters_available = check_hw_counters_available(hw_counter_base_path);
-        if (me == 0) {
-            if (hw_counters_available_check.hw_counters_available) {
-                printf("Hardware counter monitoring enabled for %s\n", hw_iface);
-            } else {
-                printf("Hardware counter monitoring requested for %s but counters not available, disabling\n", hw_iface);
-                hw_iface = NULL;
-            }
-        }
+    /* CSV metadata - set transport fields after UCC init */
+    if (csv_fp && me == 0) {
+        meta.ucc_tls = ti_ar.ucc_tls;
+        meta.ucx_tls = ti_ar.ucx_tls;
+        bench_csv_header(csv_fp);
     }
 
     if (me == 0) {
         printf("# alltoall over %d even ranks, background 128 MB allreduce over %d odd ranks\n",
                npes, world_npes - npes);
         if (hw_iface && hw_counters_available_check.hw_counters_available) {
-            printf("%-10s%-12s%15s%15s%15s%14s%14s%14s%14s%15s%15s%15s%20s\n",
+            printf("%-10s%-12s%15s%15s%15s%14s%14s%14s%14s%14s%15s%15s%15s%20s\n",
                    "Size (B)", "Total (B)",
                    "BW (MB/s)", "Agg BW (MB/s)", "Max BW (MB/s)",
                    "Avg Lat (us)", "Min Lat (us)", "Max Lat (us)", "Var (us^2)",
@@ -553,7 +555,6 @@ int main(int argc, char ** argv)
     ucc_finalize(lib);
 
     if (csv_fp && me == 0) { fflush(csv_fp); fclose(csv_fp); }
-    transport_free(tls_str);
 
     free(source);
     free(pSync);

@@ -13,10 +13,19 @@ def read_csv(path: str) -> list[dict[str, str]]:
 
 
 def summarize(rows: list[dict], group_col: str, metric: str = "avg_us"):
-    """Return per-group min / avg / max of *metric*."""
+    """Return per-group min / avg / max of *metric*, including failure-only groups."""
     groups: dict[str, list[float]] = defaultdict(list)
+    all_groups: set[str] = set()
+    failures_by_group: dict[str, int] = defaultdict(int)
+
     for r in rows:
         key = r.get(group_col, "").strip() or "(empty)"
+        all_groups.add(key)
+
+        status = r.get("status", "")
+        if "failure" in status:
+            failures_by_group[key] += 1
+
         val = r.get(metric, "").strip()
         if val:
             try:
@@ -25,10 +34,9 @@ def summarize(rows: list[dict], group_col: str, metric: str = "avg_us"):
                 pass
 
     summary: list[dict[str, object]] = []
-    for name in sorted(groups):
-        vals = groups[name]
-        n_fail = sum(1 for r in rows if r.get(group_col, "").strip() == name
-                     and "failure" in r.get("status", ""))
+    for name in sorted(all_groups):
+        vals = groups.get(name, [])
+        n_fail = failures_by_group.get(name, 0)
         summary.append({
             "group": name,
             "runs": len(vals),
