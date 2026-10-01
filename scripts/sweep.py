@@ -12,6 +12,23 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
+# Environment variables that can be swept as independent dimensions.
+# Any subset may be listed in the [env_matrix] config section (or set via
+# CLI flags); unlisted vars are passed through as a single [None] dim.
+ENV_DIMS = [
+    "UCC_TLS",
+    "UCX_TLS",
+    "UCX_DC_MLX5_NUM_DCI",
+    "UCX_IB_NUM_PATHS",
+    "UCX_MAX_RNDV_RAILS",
+]
+
+# Extra CSV columns emitted by the ICMC-aware benchmark (bench_csv_row_ext).
+ICMC_COLS = [
+    "qp_node", "qp_rank", "qp_types", "iio_rd_txn", "iio_rd_bytes",
+    "excess_rd_B_per_msg", "icm_fetch_per_msg",
+]
+
 
 def parse_size(token: str) -> int:
     """Parse a byte-size token with optional K/M suffix."""
@@ -78,9 +95,22 @@ def load_toml(path: str) -> dict:
     return cfg
 
 
+def env_dims_from_config(env_cfg: dict) -> dict:
+    """Return {dim_name: [values]} for each swept environment dimension."""
+    dims = {}
+    for name in ENV_DIMS:
+        if name in env_cfg:
+            v = env_cfg[name]
+            dims[name] = v if isinstance(v, list) else [v]
+        else:
+            dims[name] = [None]
+    return dims
+
+
 def build_launcher_cmd(
     launcher: str, nprocs: int, ppn: int | None,
     bench_path: str, msg_size: int, output_file: str,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     """Return the command list for a single benchmark invocation."""
     if launcher == "srun":
@@ -96,24 +126,42 @@ def build_launcher_cmd(
 
     cmd.append(bench_path)
     cmd.extend(["-s", str(msg_size), "-p", str(ppn) if ppn is not None else "-1", "-o", output_file])
+    if extra_args:
+        cmd.extend(extra_args)
     return cmd
+
+
+def icmc_bench_args(icc_dev, icc_backends, icc_qp, icc_frag) -> list[str]:
+    """Translate ICMC options into benchmark CLI flags (""/None -> omitted)."""
+    args: list[str] = []
+    if icc_dev:
+        args += ["-c", str(icc_dev)]
+        if icc_backends:
+            args += ["-C", str(icc_backends)]
+    if icc_qp:
+        args += ["-Q"]
+    if icc_frag:
+        args += ["-F", str(icc_frag)]
+    return args
 
 
 def run_one(
     bench: str, msg_size: int, nprocs: int, ppn: int | None,
-    ucc_tls: str | None, ucx_tls: str | None, launcher: str,
+    env_vars: dict[str, object], launcher: str,
     timeout_s: int, repo_root: str,
+    extra_args: list[str] | None = None,
 ) -> list[dict[str, object]]:
     """Execute a single benchmark run and return result row(s)."""
     ts = datetime.now(timezone.utc).isoformat()
 
     env = os.environ.copy()
-    if ucc_tls is not None:
-        env["UCC_TLS"] = ucc_tls
-    if ucx_tls is not None:
-        env["UCX_TLS"] = ucx_tls
+    for k, v in env_vars.items():
+        if v is not None:
+            env[str(k)] = str(v)
 
     bench_full = os.path.join(repo_root, bench)
+    ucc_tls = env_vars.get("UCC_TLS")
+    ucx_tls = env_vars.get("UCX_TLS")
 
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmpf:
         output_file = tmpf.name
@@ -126,6 +174,9 @@ def run_one(
         "ppn": ppn if ppn is not None else "",
         "ucc_tls": ucc_tls or "",
         "ucx_tls": ucx_tls or "",
+        "ucx_dci": env_vars.get("UCX_DC_MLX5_NUM_DCI") or "",
+        "ucx_num_paths": env_vars.get("UCX_IB_NUM_PATHS") or "",
+        "ucx_rndv_rails": env_vars.get("UCX_MAX_RNDV_RAILS") or "",
         "msg_size": msg_size,
         "iters": "",
         "avg_us": "",
@@ -135,12 +186,15 @@ def run_one(
         "bw_mbps": "",
         "status": "success",
         "config": f"bench={os.path.basename(bench)},msg_size={msg_size},nprocs={nprocs},"
-                  f"ppn={ppn or 'any'},ucc_tls={ucc_tls or 'default'},"
-                  f"ucx_tls={ucx_tls or 'default'}",
+                  f"ppn={ppn or 'any'},"
+                  + ",".join(f"{k}={v}" for k, v in env_vars.items() if v is not None),
     }
+    for c in ICMC_COLS:
+        base_row[c] = ""
 
     try:
-        cmd = build_launcher_cmd(launcher, nprocs, ppn, bench_full, msg_size, output_file)
+        cmd = build_launcher_cmd(launcher, nprocs, ppn, bench_full, msg_size,
+                                 output_file, extra_args)
         proc = subprocess.run(
             cmd, env=env, timeout=timeout_s,
             capture_output=True, text=True,
@@ -214,6 +268,12 @@ def run_one(
             if ucx_tls_val and str(ucx_tls_val).strip():
                 r["ucx_tls"] = str(ucx_tls_val).strip()
 
+            # ICMC extension columns (from bench_csv_row_ext)
+            for c in ICMC_COLS:
+                val = row.get(c, "")
+                if val is not None and str(val).strip():
+                    r[c] = str(val).strip()
+
             results.append(r)
 
         return results if results else [base_row]
@@ -234,8 +294,7 @@ def generate_slurm_script(
     sizes: list[int],
     procs: list[int],
     ppns: list[int | None],
-    ucc_tls_list: list[str | None],
-    ucx_tls_list: list[str | None],
+    env_dims: dict[str, list],
     launcher: str,
     timeout_s: int,
     repo_root: str,
@@ -246,6 +305,7 @@ def generate_slurm_script(
     partition: str | None,
     mail_type: str,
     mail_user: str,
+    icc_args: str,
     output_dir: str = "slurm-output",
 ) -> None:
     """Generate a SLURM batch script that runs all sweep combinations."""
@@ -280,15 +340,20 @@ def generate_slurm_script(
         f'COMBOS=(',
     ]
 
-    combos = list(itertools.product(benchmarks, sizes, procs, ppns, ucc_tls_list, ucx_tls_list))
-    for i, (bench, msg_sz, np_, ppn_val, ucc_t, ucx_t) in enumerate(combos):
+    combos = list(itertools.product(benchmarks, sizes, procs, ppns,
+                                    *[env_dims[d] for d in ENV_DIMS]))
+    for i, combo in enumerate(combos):
+        bench, msg_sz, np_, ppn_val = combo[0], combo[1], combo[2], combo[3]
+        env_vals = dict(zip(ENV_DIMS, combo[4:]))
         ppn_arg = str(ppn_val) if ppn_val is not None else "any"
-        ucc_t_arg = ucc_t if ucc_t else "default"
-        ucx_t_arg = ucx_t if ucx_t else "default"
+        env_args = ",".join(f"{d}={env_vals[d]}" for d in ENV_DIMS
+                            if env_vals[d] is not None)
         config_str = (f"bench={os.path.basename(bench)},msg_size={msg_sz},nprocs={np_},"
-                      f"ppn={ppn_arg},ucc_tls={ucc_t_arg},ucx_tls={ucx_t_arg}")
+                      f"ppn={ppn_arg},{env_args or 'env=default'}")
+        env_field = ",".join(str(env_vals[d]) if env_vals[d] is not None else ""
+                             for d in ENV_DIMS)
         lines.append(
-            f'  ("{bench}" "{msg_sz}" "{np_}" "{ppn_arg}" "{ucc_t_arg}" "{ucx_t_arg}" "{config_str}")'
+            f'  ("{bench}" "{msg_sz}" "{np_}" "{ppn_arg}" "{env_field}" "{config_str}")'
         )
     lines += [
         ")",
@@ -308,17 +373,20 @@ def generate_slurm_script(
         'msg_size="${COMBOS[$idx][1]}"',
         'nprocs="${COMBOS[$idx][2]}"',
         'ppn="${COMBOS[$idx][3]}"',
-        'ucc_tls="${COMBOS[$idx][4]}"',
-        'ucx_tls="${COMBOS[$idx][5]}"',
-        'config="${COMBOS[$idx][6]}"',
+        'env_field="${COMBOS[$idx][4]}"',
+        'config="${COMBOS[$idx][5]}"',
         '',
-        'echo "Running [$INDEX/$TOTAL]: bench=$bench msg_size=$msg_size nprocs=$nprocs ppn=$ppn ucc_tls=$ucc_tls ucx_tls=$ucx_tls"',
+        'echo "Running [$INDEX/$TOTAL]: bench=$bench msg_size=$msg_size nprocs=$nprocs ppn=$ppn env=$env_field"',
         '',
         f'cd "$REPO_ROOT"',
         '',
-        '# Set environment',
-        'export UCC_TLS="$ucc_tls"',
-        'export UCX_TLS="$ucx_tls"',
+        '# Set environment (comma-separated values for ' + ",".join(ENV_DIMS) + ')',
+        'IFS=, read -r E1 E2 E3 E4 E5 <<< "$env_field"',
+        '[ -n "$E1" ] && export UCC_TLS="$E1"',
+        '[ -n "$E2" ] && export UCX_TLS="$E2"',
+        '[ -n "$E3" ] && export UCX_DC_MLX5_NUM_DCI="$E3"',
+        '[ -n "$E4" ] && export UCX_IB_NUM_PATHS="$E4"',
+        '[ -n "$E5" ] && export UCX_MAX_RNDV_RAILS="$E5"',
         'export LAUNCHER="$launcher"',
         '',
         '# Create output directory',
@@ -350,11 +418,11 @@ def generate_slurm_script(
         '',
         '# Execute benchmark',
         'set +e',
-        f'$LAUNCHER_CMD "$BENCH_PATH" -s "$msg_size" -p "$ppn" -o "$OUTPUT_CSV" 2>&1 || {{',
+        f'$LAUNCHER_CMD "$BENCH_PATH" -s "$msg_size" -p "$ppn" {icc_args} -o "$OUTPUT_CSV" 2>&1 || {{',
         '    echo "Benchmark failed with rc=$?"',
         '    # Write failure row',
         '    TS=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)',
-        '    echo "$TS,$bench,,,$nprocs,$ppn,$ucc_tls,$ucx_tls,$msg_size,,,failure(rc=$?),,$config" >> "$OUTPUT_DIR/sweep_results.csv"',
+        '    echo "$TS,$bench,,,$nprocs,$ppn,$E1,$E2,$E3,$E4,$E5,$msg_size,,,failure(rc=$?),,$config" >> "$OUTPUT_DIR/sweep_results.csv"',
         '    exit 1',
         '}}',
         'set -e',
@@ -388,6 +456,21 @@ def main():
                         help='UCC_TLS values to try (repeat flag or space-separated)')
     parser.add_argument("--ucx-tls", nargs="+",
                         help='UCX_TLS values to try (repeat flag or space-separated)')
+    parser.add_argument("--ucx-dci", nargs="+",
+                        help='UCX_DC_MLX5_NUM_DCI values to try')
+    parser.add_argument("--ucx-num-paths", nargs="+",
+                        help='UCX_IB_NUM_PATHS values to try')
+    parser.add_argument("--ucx-rndv-rails", nargs="+",
+                        help='UCX_MAX_RNDV_RAILS values to try')
+    # ICMC benchmark passthrough options
+    parser.add_argument("--icc-dev", default=None,
+                        help="RDMA device for node-wide NIC counters (-c)")
+    parser.add_argument("--icc-backends", default="sysfs,iio",
+                        help="Counter backends (-C, default sysfs,iio)")
+    parser.add_argument("--icc-qp", action="store_true",
+                        help="Enable QP sampling (-Q)")
+    parser.add_argument("--icc-frag", default=None,
+                        help="Put fragment size for msgs-per-node math (-F)")
     parser.add_argument("--launcher", choices=["mpirun", "srun"], default="mpirun")
     parser.add_argument("--output", default=None,
                         help="Output CSV path (default: sweep-<ts>.csv)")
@@ -423,6 +506,9 @@ def main():
             break
         repo_root = parent
 
+    icc_args = " ".join(icmc_bench_args(args.icc_dev, args.icc_backends,
+                                       args.icc_qp, args.icc_frag))
+
     # Load config from TOML file or CLI args
     if args.config:
         cfg = load_toml(args.config)
@@ -433,9 +519,7 @@ def main():
         sizes = [parse_size(s) for s in sweep_cfg.get("msg_sizes", [])] if isinstance(sweep_cfg.get("msg_sizes"), list) else []
         procs = sweep_cfg.get("nprocs", [])
         ppns_raw = sweep_cfg.get("ppn", [None])
-
-        ucc_tls_list = env_cfg.get("UCC_TLS", [None])
-        ucx_tls_list = env_cfg.get("UCX_TLS", [None])
+        env_dims = env_dims_from_config(env_cfg)
     else:
         if not args.msg_sizes or not args.benchmarks:
             parser.error("--msg-sizes and --benchmarks are required without --config")
@@ -444,10 +528,25 @@ def main():
         sizes = [parse_size(s) for s in args.msg_sizes.split(",")]
         procs = [int(p.strip()) for p in args.nprocs.split(",")] if args.nprocs else []
         ppns_raw = ([int(x.strip()) for x in args.ppn.split(",")] if args.ppn else [None])
-        ucc_tls_list = args.ucc_tls or [None]
-        ucx_tls_list = args.ucx_tls or [None]
+        def _split_commas(tokens: list[str] | None) -> list[str]:
+            return [t for tok in (tokens or []) for t in tok.split(",") if t.strip()]
+        env_dims = env_dims_from_config({
+            "UCC_TLS": _split_commas(args.ucc_tls) or [None],
+            "UCX_TLS": _split_commas(args.ucx_tls) or [None],
+            "UCX_DC_MLX5_NUM_DCI": _split_commas(args.ucx_dci) or [None],
+            "UCX_IB_NUM_PATHS": _split_commas(args.ucx_num_paths) or [None],
+            "UCX_MAX_RNDV_RAILS": _split_commas(args.ucx_rndv_rails) or [None],
+        })
 
     ppns = ppns_raw if isinstance(ppns_raw, list) else [ppns_raw]
+
+    fieldnames = [
+        "timestamp", "bench", "variant", "nprocs", "ppn",
+        "ucc_tls", "ucx_tls", "ucx_dci", "ucx_num_paths", "ucx_rndv_rails",
+        "msg_size", "iters",
+        "avg_us", "min_us", "max_us", "stddev_us",
+        "bw_mbps", "status", "config",
+    ] + ICMC_COLS
 
     # SLURM mode: generate batch scripts instead of running
     if args.slurm:
@@ -460,8 +559,7 @@ def main():
             sizes=sizes,
             procs=procs,
             ppns=ppns,
-            ucc_tls_list=ucc_tls_list,
-            ucx_tls_list=ucx_tls_list,
+            env_dims=env_dims,
             launcher=args.launcher,
             timeout_s=args.timeout,
             repo_root=repo_root,
@@ -472,23 +570,16 @@ def main():
             partition=args.slurm_partition,
             mail_type=args.slurm_mail_type,
             mail_user=args.slurm_mail_user,
+            icc_args=icc_args,
             output_dir=slurm_dir,
         )
         # Write sweep_results.csv header
         results_csv = os.path.join(slurm_dir, "sweep_results.csv")
-        fieldnames = [
-            "timestamp", "bench", "variant", "nprocs", "ppn",
-            "ucc_tls", "ucx_tls", "msg_size", "iters",
-            "avg_us", "min_us", "max_us", "stddev_us",
-            "bw_mbps", "status", "config",
-        ]
         with open(results_csv, "w", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-        combos = list(itertools.product(
-            benchmarks, sizes, procs, ppns,
-            ucc_tls_list, ucx_tls_list,
-        ))
+        combos = list(itertools.product(benchmarks, sizes, procs, ppns,
+                                        *[env_dims[d] for d in ENV_DIMS]))
         total = len(combos)
         print(f"Generated SLURM script: {script_path}")
         print(f"Array job with {total} tasks (1 task = 1 combination)")
@@ -496,21 +587,12 @@ def main():
         print(f"Results will be collected in: {results_csv}")
         return
 
-    combos = list(itertools.product(
-        benchmarks, sizes, procs, ppns,
-        ucc_tls_list, ucx_tls_list,
-    ))
+    combos = list(itertools.product(benchmarks, sizes, procs, ppns,
+                                    *[env_dims[d] for d in ENV_DIMS]))
 
     outpath = args.output or (
         f"sweep-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     )
-
-    fieldnames = [
-        "timestamp", "bench", "variant", "nprocs", "ppn",
-        "ucc_tls", "ucx_tls", "msg_size", "iters",
-        "avg_us", "min_us", "max_us", "stddev_us",
-        "bw_mbps", "status", "config",
-    ]
 
     total = len(combos)
     written = 0
@@ -519,14 +601,18 @@ def main():
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        for idx, (bench, msg_sz, np_, ppn_val, ucc_t, ucx_t) in enumerate(combos):
+        for idx, combo in enumerate(combos):
+            bench, msg_sz, np_, ppn_val = combo[0], combo[1], combo[2], combo[3]
+            env_vars = dict(zip(ENV_DIMS, combo[4:]))
             sys.stderr.write(
                 f"\r[{idx + 1}/{total}] bench={os.path.basename(bench)} "
                 f"msg={msg_sz} np={np_}"
             )
             rows = run_one(
-                bench, msg_sz, np_, ppn_val, ucc_t, ucx_t,
+                bench, msg_sz, np_, ppn_val, env_vars,
                 args.launcher, args.timeout, repo_root,
+                icmc_bench_args(args.icc_dev, args.icc_backends,
+                               args.icc_qp, args.icc_frag),
             )
             for row in rows:
                 writer.writerow(row)
